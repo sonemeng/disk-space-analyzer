@@ -1,6 +1,6 @@
 [package]
 name = "disk-analyzer"
-version = "6.0.0"
+version = "6.1.0"
 description = "Modern disk space analyzer with Vue 3 UI"
 authors = ["songmeng <songmeng@hotmail.com>"]
 license = "MIT"
@@ -23,6 +23,9 @@ rayon = "1.10"
 trash = "5.2"
 semver = "1.0"
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

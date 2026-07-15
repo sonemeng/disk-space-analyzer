@@ -1,6 +1,6 @@
 {
   "name": "disk-analyzer",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "private": true,
   "description": "Modern disk space analyzer with Vue 3 + Tauri",
   "scripts": {

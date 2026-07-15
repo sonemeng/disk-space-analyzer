@@ -14,6 +14,7 @@ import {
   ChevronRight,
   CircleStop,
   Download,
+  Database,
   Fingerprint,
   ExternalLink,
   FileSearch,
@@ -45,6 +46,7 @@ import {
   X,
 } from '@lucide/vue'
 import MediaCenter from './MediaCenter.vue'
+import RegistryCleaner from './RegistryCleaner.vue'
 
 interface DiskUsage { total: number; used: number; free: number }
 interface DirectoryItem { path: string; name: string; size: number; fileCount: number; dirCount: number }
@@ -169,6 +171,7 @@ const updateStatus = ref<UpdateStatus | null>(null)
 const settingsBusy = ref('')
 const confirmClearHistory = ref(false)
 const sidebarCollapsed = ref(false)
+const mediaNew = ref(localStorage.getItem('disk-analyzer-seen-media-v6') !== '1')
 const drives = ref<string[]>([])
 const selectedDrive = ref('C:')
 const usage = ref<DiskUsage | null>(null)
@@ -179,7 +182,7 @@ const folderAnalyzing = ref(false)
 const cleaning = ref(false)
 const loadingDrives = ref(true)
 const loadingCleanup = ref(false)
-const page = ref<'overview' | 'cleanup' | 'files' | 'insights' | 'media'>('overview')
+const page = ref<'overview' | 'cleanup' | 'files' | 'insights' | 'media' | 'registry'>('overview')
 const analysisTab = ref<'duplicates' | 'history' | 'age'>('duplicates')
 const fileTab = ref<'directories' | 'files'>('directories')
 const query = ref('')
@@ -236,7 +239,7 @@ const longUnusedFiles = computed(() => result.value?.largeFiles.filter(file => (
 const latestSnapshot = computed(() => snapshots.value[snapshots.value.length - 1] ?? null)
 const previousSnapshot = computed(() => snapshots.value[snapshots.value.length - 2] ?? null)
 const snapshotDelta = computed(() => latestSnapshot.value && previousSnapshot.value ? latestSnapshot.value.used - previousSnapshot.value.used : 0)
-const pageTitle = computed(() => ({ overview: '空间概览', cleanup: '清理中心', files: '文件审查', insights: '深度分析', media: '媒体管理' }[page.value]))
+const pageTitle = computed(() => ({ overview: '空间概览', cleanup: '清理中心', files: '文件审查', insights: '深度分析', media: '媒体管理', registry: '注册表检查' }[page.value]))
 const scanOptions = computed(() => ({
   exclusions: exclusionPaths.value,
   largeFileBytes: largeFileMb.value * 1024 * 1024,
@@ -301,6 +304,12 @@ function persistAdvancedSettings() {
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
   localStorage.setItem('disk-analyzer-sidebar-collapsed', String(sidebarCollapsed.value))
+}
+
+function openMediaCenter() {
+  page.value = 'media'
+  mediaNew.value = false
+  localStorage.setItem('disk-analyzer-seen-media-v6', '1')
 }
 
 async function refreshUsage() {
@@ -669,10 +678,10 @@ async function checkUpdates(silent = false) {
   try {
     updateStatus.value = isTauri
       ? await invoke<UpdateStatus>('check_for_updates', { repository: 'sonemeng/disk-space-analyzer' })
-      : { currentVersion: '6.0.0', latestVersion: null, available: false, message: '仓库发布后即可检查更新' }
+      : { currentVersion: '6.1.0', latestVersion: null, available: false, message: '仓库发布后即可检查更新' }
     if (!silent) notice.value = updateStatus.value.message
   } catch (value) {
-    updateStatus.value = { currentVersion: '6.0.0', available: false, message: String(value) }
+    updateStatus.value = { currentVersion: '6.1.0', available: false, message: String(value) }
     if (!silent) handleError(value)
   } finally { settingsBusy.value = '' }
 }
@@ -717,7 +726,8 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
         <button title="清理中心" :class="{ active: page === 'cleanup' }" @click="page = 'cleanup'"><Trash2 :size="17" /><span>清理中心</span><b v-if="cleanup?.safeBytes">{{ formatSize(cleanup.safeBytes) }}</b></button>
         <button title="文件审查" :class="{ active: page === 'files' }" @click="page = 'files'"><FileSearch :size="17" /><span>文件审查</span><b v-if="result">{{ result.largeFiles.length }}</b></button>
         <button title="深度分析" :class="{ active: page === 'insights' }" @click="page = 'insights'"><ChartNoAxesCombined :size="17" /><span>深度分析</span></button>
-        <button title="媒体管理" :class="{ active: page === 'media' }" @click="page = 'media'"><Library :size="17" /><span>媒体管理</span><b>NEW</b></button>
+        <button title="媒体管理" :class="{ active: page === 'media' }" @click="openMediaCenter"><Library :size="17" /><span>媒体管理</span><b v-if="mediaNew">NEW</b></button>
+        <button title="注册表检查" :class="{ active: page === 'registry' }" @click="page = 'registry'"><Database :size="17" /><span>注册表检查</span></button>
       </nav>
 
       <div class="sidebar-label sidebar-drive-title"><span>本机磁盘</span><button title="重新检测磁盘" :disabled="loadingDrives" @click="loadDrives"><RefreshCw :size="12" :class="{ spin: loadingDrives }" /></button></div>
@@ -733,17 +743,17 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
       <button class="settings-trigger" title="设置" @click="showSettings = true"><Settings :size="17" /><span><b>设置</b><small>{{ themeOptions.find(theme => theme.id === activeTheme)?.name }} · {{ fontScale === 'large' ? '大字号' : fontScale === 'small' ? '小字号' : '标准字号' }}</small></span><ChevronRight :size="15" /></button>
       <div class="safety-note"><ShieldCheck :size="17" /><div><b>默认只读</b><span>只有低风险白名单项目可在确认后清理</span></div></div>
       <div v-if="!isTauri" class="preview-badge"><Info :size="14" /> 界面预览</div>
-      <div class="version">TAURI EDITION · 6.0</div>
+      <div class="version">TAURI EDITION · 6.1</div>
     </aside>
 
     <main class="workspace">
       <header class="topbar">
-        <div><div class="eyebrow">{{ page === 'media' ? '本地媒体' : `${selectedDrive}\\` }} {{ pageTitle }}</div><h1>{{ pageTitle }}</h1></div>
+        <div><div class="eyebrow">{{ page === 'media' ? '本地媒体' : page === 'registry' ? 'Windows 当前用户' : `${selectedDrive}\\` }} {{ pageTitle }}</div><h1>{{ pageTitle }}</h1></div>
         <div class="actions">
           <button v-if="result && page === 'overview'" class="button secondary" @click="exportReport"><Download :size="17" /> 导出报告</button>
           <button v-if="page === 'files'" class="button secondary" :disabled="folderAnalyzing" @click="chooseFolder"><FolderSearch :size="17" /> 选择文件夹</button>
           <button v-if="scanning || folderAnalyzing || duplicateScanning" class="button danger" @click="cancelScan"><CircleStop :size="17" /> 取消分析</button>
-          <button v-else-if="page !== 'media'" class="button primary" :disabled="!selectedDrive" @click="startScan"><Play :size="17" fill="currentColor" /> {{ result ? '重新扫描' : '完整扫描' }}</button>
+          <button v-else-if="page !== 'media' && page !== 'registry'" class="button primary" :disabled="!selectedDrive" @click="startScan"><Play :size="17" fill="currentColor" /> {{ result ? '重新扫描' : '完整扫描' }}</button>
         </div>
       </header>
 
@@ -766,8 +776,12 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
         <div class="current-path" :title="duplicateProgress.currentPath">{{ duplicateProgress.currentPath || '正在读取文件内容…' }}</div>
       </section>
 
-      <template v-if="page === 'media'">
-        <MediaCenter :exclusions="exclusionPaths" :large-file-mb="largeFileMb" :scan-threads="scanThreads" :recycle-policy="recyclePolicy" />
+      <template v-if="page === 'registry'">
+        <RegistryCleaner />
+      </template>
+
+      <template v-else-if="page === 'media'">
+        <MediaCenter :exclusions="exclusionPaths" :large-file-mb="largeFileMb" :scan-threads="scanThreads" :recycle-policy="recyclePolicy" :drives="drives" :selected-drive="selectedDrive" />
       </template>
 
       <template v-else-if="page === 'overview'">
@@ -986,7 +1000,7 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
         </div>
 
         <div v-else class="settings-content about-content">
-          <div class="about-product"><span class="about-mark"><HardDrive :size="28" /></span><div><h3>磁盘空间分析器</h3><p>Windows 本地空间诊断、媒体管理与安全清理工具</p><b>版本 6.0.0</b></div></div>
+          <div class="about-product"><span class="about-mark"><HardDrive :size="28" /></span><div><h3>磁盘空间分析器</h3><p>Windows 本地空间诊断、媒体管理与安全清理工具</p><b>版本 6.1.0</b></div></div>
           <section class="about-section"><h4>系统架构</h4><dl><div><dt>桌面框架</dt><dd>Tauri 2</dd></div><div><dt>用户界面</dt><dd>Vue 3 + TypeScript</dd></div><div><dt>扫描引擎</dt><dd>Rust</dd></div><div><dt>运行平台</dt><dd>Windows 10 / 11 · 64 位</dd></div></dl></section>
           <section class="about-section"><h4>作者信息</h4><dl><div><dt>项目作者 / GitHub</dt><dd>songmeng@hotmail.com</dd></div><div><dt>软件许可</dt><dd>MIT License</dd></div></dl></section>
           <section class="about-safety"><ShieldCheck :size="20" /><div><b>本地优先，删除可恢复</b><p>扫描、哈希、缩略图和历史快照均在本机处理。媒体整理统一使用 Windows 回收站。</p></div></section>
@@ -1048,6 +1062,7 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
 .collapse-button{position:static!important;right:auto!important;top:auto!important;width:30px;height:30px;border:1px solid var(--sidebar-border)!important;background:#fff!important;color:var(--accent-ink)!important;border-radius:5px;display:grid;place-items:center;box-shadow:0 2px 8px #34405412}.collapse-button:hover{border-color:var(--accent)!important;background:var(--accent-soft)!important;color:var(--accent-ink)!important}
 .main-nav button,.drive-button{color:var(--sidebar-muted)}.main-nav button:hover,.drive-button:hover{background:var(--sidebar-hover);color:var(--sidebar-text);box-shadow:0 2px 9px #3440540d}.main-nav button.active,.drive-button.active{background:var(--sidebar-active);color:var(--accent-ink);box-shadow:inset 3px 0 0 var(--accent),0 3px 12px #34405414}.main-nav button b{background:#fff0f3;color:#d92d5b}.main-nav button:nth-child(1)>svg{color:#3182f6}.main-nav button:nth-child(2)>svg{color:#ff5d5d}.main-nav button:nth-child(3)>svg{color:#f59e0b}.main-nav button:nth-child(4)>svg{color:#8b5cf6}
 .main-nav button:nth-child(5)>svg{color:#12a47b}.sidebar{overflow-y:auto}
+.main-nav button:nth-child(6)>svg{color:#3182f6}
 .sidebar-label,.sidebar-drive-title button{color:var(--sidebar-muted)}.sidebar-drive-title button:hover{color:var(--accent)}.drive-button span small,.drive-loading{color:#7d8896}.drive-button>svg{color:#12a47b}
 .safety-note{color:#087355;background:#e8fbf4;border-color:#bdebdc}.safety-note span{color:#397b69}.version{color:#98a2b3}.preview-badge{color:#a15c00}
 .settings-trigger{width:100%;min-height:48px;border:0;background:transparent;color:var(--sidebar-muted);border-radius:5px;padding:7px 9px;margin-bottom:8px;display:grid;grid-template-columns:19px 1fr 16px;gap:9px;align-items:center;text-align:left}.settings-trigger:hover{background:#fff;color:var(--sidebar-text);box-shadow:0 2px 9px #3440540d}.settings-trigger>svg:first-child{color:#f97316}.settings-trigger b,.settings-trigger small{display:block}.settings-trigger b{color:#344054}.settings-trigger small{color:#7d8896;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

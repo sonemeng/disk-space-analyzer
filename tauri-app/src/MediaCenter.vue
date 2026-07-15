@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -13,6 +13,7 @@ import {
   FileVideo,
   Files,
   FolderOpen,
+  HardDrive,
   Image as ImageIcon,
   Images,
   LoaderCircle,
@@ -77,6 +78,8 @@ const props = defineProps<{
   largeFileMb: number
   scanThreads: number
   recyclePolicy: 'confirm' | 'direct'
+  drives: string[]
+  selectedDrive: string
 }>()
 
 const isTauri = '__TAURI_INTERNALS__' in window
@@ -84,6 +87,7 @@ const result = ref<MediaScanResult | null>(null)
 const scanning = ref(false)
 const recycling = ref(false)
 const scope = ref('')
+const driveChoice = ref(props.selectedDrive || props.drives[0] || 'C:')
 const progress = ref<Progress>({ message: '等待选择媒体文件夹', percentage: 0 })
 const error = ref('')
 const notice = ref('')
@@ -187,6 +191,12 @@ async function chooseFolder() {
   } catch (value) { error.value = String(value) }
 }
 
+async function scanDrive() {
+  if (!driveChoice.value) return
+  const root = driveChoice.value.endsWith('\\') ? driveChoice.value : `${driveChoice.value}\\`
+  await scanMedia(root)
+}
+
 async function cancel() {
   try { await invoke('cancel_scan') } catch (value) { error.value = String(value) }
 }
@@ -248,6 +258,9 @@ async function openMedia(path: string) {
 onMounted(async () => {
   if (isTauri) unlisten = await listen<Progress>('media-progress', event => { progress.value = event.payload })
 })
+watch(() => props.selectedDrive, value => {
+  if (value && props.drives.includes(value)) driveChoice.value = value
+})
 onBeforeUnmount(() => { unlisten?.() })
 </script>
 
@@ -258,8 +271,8 @@ onBeforeUnmount(() => { unlisten?.() })
 
     <section class="media-scope panel">
       <span class="scope-icon"><Images :size="23" /></span>
-      <div><span class="panel-kicker">媒体分析范围</span><h2>{{ scope || '尚未选择文件夹' }}</h2><p>图片相似度、音视频属性和重复校验均在本机完成。</p></div>
-      <div class="scope-actions"><button class="button secondary" :disabled="scanning" @click="chooseFolder"><FolderOpen :size="16" /> 选择文件夹</button><button v-if="scanning" class="button danger" @click="cancel"><CircleStop :size="16" /> 取消</button><button v-else class="button primary" :disabled="!scope" @click="scanMedia()"><Play :size="16" /> 重新分析</button></div>
+      <div><span class="panel-kicker">媒体分析范围</span><h2>{{ scope || '尚未选择文件夹或磁盘' }}</h2><p>可分析整个磁盘或指定文件夹，图片相似度、音视频属性和重复校验均在本机完成。</p></div>
+      <div class="scope-actions"><label class="drive-scope" title="选择要分析的磁盘"><HardDrive :size="15" /><select v-model="driveChoice" :disabled="scanning"><option v-for="drive in drives" :key="drive" :value="drive">{{ drive }} 整盘</option></select></label><button class="button secondary" :disabled="scanning || !driveChoice" @click="scanDrive"><HardDrive :size="16" /> 分析整盘</button><button class="button secondary" :disabled="scanning" @click="chooseFolder"><FolderOpen :size="16" /> 选择文件夹</button><button v-if="scanning" class="button danger" @click="cancel"><CircleStop :size="16" /> 取消</button><button v-else-if="scope" class="button primary" @click="scanMedia()"><Play :size="16" /> 重新分析</button></div>
     </section>
 
     <section v-if="scanning" class="media-progress panel"><div><LoaderCircle :size="17" class="spin" /><strong>{{ progress.message }}</strong><b>{{ progress.percentage }}%</b></div><i><em :style="{ width: `${progress.percentage}%` }" /></i><small :title="progress.currentPath">{{ progress.currentPath }}</small></section>
@@ -295,7 +308,7 @@ onBeforeUnmount(() => { unlisten?.() })
       </section>
     </template>
 
-    <section v-else-if="!scanning" class="media-welcome panel"><div><Images :size="45" /></div><h2>整理图片、视频和音频</h2><p>选择媒体文件夹后，可查找完全重复与相似图片，统计音视频属性，并将确认不要的内容移入回收站。</p><button class="button primary" @click="chooseFolder"><FolderOpen :size="17" /> 选择媒体文件夹</button></section>
+    <section v-else-if="!scanning" class="media-welcome panel"><div><Images :size="45" /></div><h2>整理图片、视频和音频</h2><p>分析整个磁盘或指定媒体文件夹，查找完全重复与相似图片，统计音视频属性，并将确认不要的内容移入回收站。</p><div class="welcome-actions"><button class="button primary" :disabled="!driveChoice" @click="scanDrive"><HardDrive :size="17" /> 分析 {{ driveChoice }} 整盘</button><button class="button secondary" @click="chooseFolder"><FolderOpen :size="17" /> 选择媒体文件夹</button></div></section>
 
     <div v-if="previewItem" class="media-modal" @click.self="previewItem = null"><section class="media-preview" role="dialog" aria-modal="true" aria-label="媒体预览"><button class="preview-close" title="关闭预览" @click="previewItem = null"><X :size="18" /></button><div class="preview-visual" :class="previewItem.kind"><img v-if="previewItem.thumbnail" :src="previewItem.thumbnail" :alt="previewItem.name"><ImageIcon v-else-if="previewItem.kind === 'image'" :size="54" /><FileVideo v-else-if="previewItem.kind === 'video'" :size="54" /><FileAudio v-else :size="54" /></div><div class="preview-copy"><span class="panel-kicker">媒体详情</span><h2>{{ previewItem.name }}</h2><p>{{ itemMetadata(previewItem) }}</p><dl><div><dt>大小</dt><dd>{{ formatSize(previewItem.size) }}</dd></div><div><dt>格式</dt><dd>{{ previewItem.format }}</dd></div><div v-if="previewItem.blurScore != null"><dt>清晰度分数</dt><dd>{{ previewItem.blurScore.toFixed(1) }}</dd></div><div><dt>路径</dt><dd :title="previewItem.path">{{ previewItem.path }}</dd></div></dl><div class="preview-actions"><button class="button secondary" @click="openInExplorer(previewItem.path)"><ExternalLink :size="16" /> 定位文件</button><button class="button primary" @click="openMedia(previewItem.path)"><Play :size="16" /> {{ previewItem.kind === 'image' ? '系统查看' : '系统播放器预览' }}</button></div></div></section></div>
 
@@ -307,4 +320,6 @@ onBeforeUnmount(() => { unlisten?.() })
 .media-center{display:grid;gap:14px}.media-alert{min-height:42px;padding:9px 12px;border-radius:5px;display:flex;align-items:center;gap:9px}.media-alert span{flex:1}.media-alert button{border:0;background:transparent;color:inherit;display:grid;place-items:center}.media-alert.error{background:#fff0f0;border:1px solid #ffcaca;color:#a52b2b}.media-alert.notice{background:#effaf6;border:1px solid #ccecdf;color:#087355}.media-scope{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:13px}.scope-icon{width:44px;height:44px;border-radius:6px;background:var(--accent-soft);color:var(--accent-ink);display:grid;place-items:center}.media-scope h2{margin:3px 0;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-scope p{margin:0;color:#667085}.scope-actions{display:flex;gap:8px}.media-progress{padding-top:13px;padding-bottom:13px}.media-progress>div{display:flex;align-items:center;gap:8px}.media-progress strong{flex:1}.media-progress b{color:var(--accent)}.media-progress>i{display:block;height:5px;background:#edf0f2;border-radius:3px;overflow:hidden;margin:10px 0 6px}.media-progress>i em{display:block;height:100%;background:var(--accent-gradient)}.media-progress small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#8a94a3}.media-metrics{display:grid;grid-template-columns:repeat(4,1fr);background:#fff;border:1px solid #dfe3e8;border-radius:6px}.media-metrics>div{min-height:92px;padding:16px 18px;display:flex;align-items:center;gap:11px;border-right:1px solid #e7eaee}.media-metrics>div:last-child{border:0}.media-metric-icon{width:38px;height:38px;border-radius:6px;display:grid;place-items:center}.media-metric-icon.image{background:#eaf4ff;color:#3182f6}.media-metric-icon.video{background:#fff0f5;color:#e94b72}.media-metric-icon.audio{background:#e8fbf4;color:#12a47b}.media-metric-icon.duplicate{background:#fff5e6;color:#e18a00}.media-metrics small,.media-metrics b,.media-metrics span{display:block}.media-metrics b{font-size:18px;margin:2px 0}.media-metrics small,.media-metrics>div>div>span{color:#7d8896}.media-toolbar{padding:9px;display:flex;align-items:center;gap:9px}.media-kind-tabs{display:flex;align-self:stretch;background:#f2f4f7;border-radius:5px;padding:2px}.media-kind-tabs button{min-width:56px;border:0;background:transparent;color:#667085;border-radius:4px;padding:0 10px}.media-kind-tabs button.active{background:#fff;color:var(--accent-ink);box-shadow:0 1px 4px #1018281a}.media-filter{height:36px;min-width:150px;border:1px solid #d7dce2;border-radius:5px;display:flex;align-items:center;gap:7px;padding:0 9px;color:#667085}.media-filter select{border:0;background:transparent;outline:0;flex:1;color:#344054}.media-toolbar>.text-button{margin-left:auto}.recycle-button{height:38px;border:0;border-radius:5px;background:#eaf8f3;color:#087355;display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:0 13px;font-weight:650;white-space:nowrap}.recycle-button:hover{background:#d9f2e8}.recycle-button:disabled{opacity:.45;cursor:not-allowed}.media-results{padding:0;overflow:hidden}.media-results>header{min-height:66px;padding:13px 17px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #e4e7eb}.media-results h2{margin:3px 0}.media-results>header>div:last-child{display:flex;gap:7px}.media-results>header>div:last-child span{padding:3px 7px;border-radius:3px;background:#f2f4f7;color:#667085}.media-row{min-height:94px;padding:11px 15px;display:grid;grid-template-columns:22px 78px minmax(260px,1fr) 112px 102px;gap:12px;align-items:center;border-bottom:1px solid #edf0f2}.media-row.selected{background:var(--accent-soft)}.media-check{width:20px;height:20px;padding:0;border:1px solid #b8c0ca;background:#fff;border-radius:4px;color:#fff;display:grid;place-items:center}.media-check.checked{background:var(--accent);border-color:var(--accent)}.media-thumb{width:78px;height:64px;border-radius:5px;background:#eef2f6;color:#667085;display:grid;place-items:center;overflow:hidden}.media-thumb.image{background:#eaf4ff;color:#3182f6}.media-thumb.video{background:#fff0f5;color:#e94b72}.media-thumb.audio{background:#e8fbf4;color:#12a47b}.media-thumb img{width:100%;height:100%;object-fit:cover}.media-copy{min-width:0}.media-copy>div:first-child{display:flex;align-items:center;gap:7px}.media-copy b{max-width:420px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.format-badge{padding:2px 5px;border-radius:3px;background:#f2f4f7;color:#667085}.media-copy p{margin:4px 0;color:#475467;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-copy small{display:block;color:#98a2b3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-flags{display:flex;gap:5px;margin-top:5px;flex-wrap:wrap}.media-flags span{padding:2px 5px;border-radius:3px;background:#eef2f6;color:#667085}.media-flags .critical{background:#fff0f0;color:#c43232}.media-flags .similar{background:#f0e9ff;color:#6842a1}.media-flags .warning{background:#fff5e6;color:#9a6500}.media-size{text-align:right}.media-size b,.media-size span{display:block}.media-size span{color:#98a2b3;margin-top:4px}.media-actions{display:flex;justify-content:flex-end;gap:3px}.media-actions button{width:30px;height:30px;border:0;background:transparent;color:#7d8896;border-radius:4px;display:grid;place-items:center}.media-actions button:hover{background:#fff;color:var(--accent-ink)}.media-empty{padding:40px;text-align:center;color:#98a2b3}.media-results>footer{min-height:42px;padding:10px 16px;background:#f7faf9;color:#4d7f6d;display:flex;align-items:center;gap:8px}.media-welcome{min-height:430px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}.media-welcome>div{width:88px;height:88px;border-radius:50%;background:var(--accent-soft);color:var(--accent-ink);display:grid;place-items:center}.media-welcome h2{margin:16px 0 6px}.media-welcome p{max-width:580px;color:#667085;line-height:1.7;margin:0 0 18px}.media-modal{position:fixed;inset:0;background:#10182880;z-index:60;display:grid;place-items:center;padding:20px}.media-preview{width:min(780px,100%);max-height:calc(100vh - 40px);overflow:auto;background:#fff;border-radius:7px;box-shadow:0 22px 60px #10182855;display:grid;grid-template-columns:minmax(280px,1fr) minmax(300px,.9fr);position:relative}.preview-close{position:absolute;right:13px;top:13px;z-index:2;width:32px;height:32px;border:0;background:#ffffffdd;color:#667085;border-radius:4px;display:grid;place-items:center}.preview-visual{min-height:390px;background:#eef2f6;color:#667085;display:grid;place-items:center;overflow:hidden}.preview-visual.image{background:#eaf4ff;color:#3182f6}.preview-visual.video{background:#fff0f5;color:#e94b72}.preview-visual.audio{background:#e8fbf4;color:#12a47b}.preview-visual img{width:100%;height:100%;max-height:520px;object-fit:contain}.preview-copy{padding:32px 28px}.preview-copy h2{margin:5px 0 8px;word-break:break-word}.preview-copy>p{color:#667085;margin:0 0 18px}.preview-copy dl{margin:0}.preview-copy dl>div{min-height:38px;display:grid;grid-template-columns:100px minmax(0,1fr);gap:12px;align-items:center;border-bottom:1px solid #edf0f2}.preview-copy dt{color:#7d8896}.preview-copy dd{margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.preview-actions{display:flex;gap:8px;margin-top:22px}.recycle-dialog{width:min(430px,100%);background:#fff;border-radius:7px;padding:25px;box-shadow:0 22px 60px #10182855;text-align:center}.recycle-dialog>span{width:52px;height:52px;border-radius:7px;background:#eaf8f3;color:#087355;display:grid;place-items:center;margin:auto}.recycle-dialog h2{margin:15px 0 7px}.recycle-dialog p{color:#667085;line-height:1.6;margin:0}.recycle-dialog>div{display:flex;justify-content:center;gap:8px;margin-top:20px}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:1050px){.media-metrics{grid-template-columns:1fr 1fr}.media-metrics>div:nth-child(2){border-right:0}.media-metrics>div:nth-child(-n+2){border-bottom:1px solid #e7eaee}.media-toolbar{flex-wrap:wrap}.media-toolbar>.text-button{margin-left:0}.media-row{grid-template-columns:22px 64px minmax(220px,1fr) 100px}.media-thumb{width:64px;height:58px}.media-actions{grid-column:3 / 5;justify-content:flex-start}.media-preview{grid-template-columns:1fr}.preview-visual{min-height:280px}}
 @media(max-width:800px){.media-scope{grid-template-columns:40px 1fr}.scope-actions{grid-column:1 / -1;flex-wrap:wrap}.scope-actions .button{flex:1}.media-metrics{grid-template-columns:1fr 1fr}.media-kind-tabs{width:100%}.media-kind-tabs button{flex:1}.media-filter{flex:1}.media-toolbar>.text-button{margin-left:auto}.media-row{grid-template-columns:20px 54px minmax(0,1fr)}.media-thumb{width:54px;height:50px}.media-size{grid-column:3;text-align:left}.media-actions{grid-column:3;justify-content:flex-start}.preview-copy{padding:24px 20px}}
+.scope-actions{align-items:center;justify-content:flex-end;flex-wrap:wrap;max-width:570px}.drive-scope{height:38px;border:1px solid #d7dce2;border-radius:5px;background:#fff;color:#667085;display:flex;align-items:center;gap:6px;padding:0 8px}.drive-scope select{border:0;background:transparent;color:#344054;outline:0}.media-welcome>.welcome-actions{width:auto;height:auto;border-radius:0;background:transparent;color:inherit;display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+@media(max-width:1150px){.media-scope{grid-template-columns:44px minmax(0,1fr)}.scope-actions{grid-column:1 / -1;max-width:none;justify-content:flex-start}}
 </style>

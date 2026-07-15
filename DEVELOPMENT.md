@@ -20,7 +20,7 @@
 └── docs/                 # 扩展文档
 ```
 
-### Tauri 6.0
+### Tauri 6.1
 
 ```
 tauri-app/

@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod media;
+mod registry;
 
 use media::{MediaScanOptions, MediaScanResult, RecycleResult};
 use serde::{Deserialize, Serialize};
@@ -1044,6 +1045,20 @@ async fn recycle_media(paths: Vec<String>) -> Result<RecycleResult, String> {
         .map_err(|error| format!("回收站任务异常: {error}"))?
 }
 
+#[tauri::command]
+async fn analyze_registry() -> Result<registry::RegistryReport, String> {
+    tauri::async_runtime::spawn_blocking(registry::scan_registry)
+        .await
+        .map_err(|error| format!("注册表检查任务异常: {error}"))?
+}
+
+#[tauri::command]
+async fn repair_registry(ids: Vec<String>) -> Result<registry::RegistryRepairResult, String> {
+    tauri::async_runtime::spawn_blocking(move || registry::repair_registry(ids))
+        .await
+        .map_err(|error| format!("注册表修复任务异常: {error}"))?
+}
+
 fn snapshot_file() -> Result<PathBuf, String> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -1716,6 +1731,8 @@ fn main() {
             find_duplicates,
             scan_media,
             recycle_media,
+            analyze_registry,
+            repair_registry,
             cancel_scan,
             get_drives,
             get_disk_usage,
