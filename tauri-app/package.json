@@ -1,0 +1,25 @@
+{
+  "name": "disk-analyzer",
+  "version": "5.1.0",
+  "private": true,
+  "description": "Modern disk space analyzer with Vue 3 + Tauri",
+  "scripts": {
+    "dev": "vite --mode development",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.24.0",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "typescript": "^5.3.0",
+    "vite": "^5.0.0",
+    "vue-tsc": "^2.2.0"
+  }
+}

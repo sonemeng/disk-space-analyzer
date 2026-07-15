@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+build_tmp/
+node_modules/
+target/
+.npm-cache/
+*.spec
+!磁盘空间分析器.spec
+
+# Windows
+*.dll
+*.manifest
+
+# IDE
+.vscode/
+.idea/
+.agents/
+*.swp
+*.swo
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# PyInstaller artifacts
+*.exe
+!dist/*.exe
+
+# Project specific
+*.log
+nul

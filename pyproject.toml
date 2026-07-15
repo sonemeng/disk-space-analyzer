@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disk-analyzer"
+version = "3.0.1"
+description = "磁盘空间分析器 — Windows 原生桌面应用"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["disk-space", "analyzer", "windows", "cleanup"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+requires-python = ">=3.10"
+
+[project.scripts]
+disk-analyzer = "src.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+src = ["py.typed"]

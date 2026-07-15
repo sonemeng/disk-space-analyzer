@@ -1,0 +1,11 @@
+{
+  "windows": {
+    "manifestPath": null,
+    "iconPaths": [
+      "../assets/icon.png",
+      "../assets/icon.ico"
+    ],
+    "allowRemoteUrl": true,
+    "devUrl": "http://localhost:5173"
+  }
+}
