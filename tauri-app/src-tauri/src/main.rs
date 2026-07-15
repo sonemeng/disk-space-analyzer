@@ -1,5 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod media;
+
+use media::{MediaScanOptions, MediaScanResult, RecycleResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -26,6 +29,13 @@ struct ScanProgress {
     message: String,
     percentage: u8,
     current_path: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanOptions {
+    exclusions: Vec<String>,
+    large_file_bytes: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -182,6 +192,16 @@ struct ScanSnapshot {
     age_buckets: Vec<AgeBucket>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStatus {
+    current_version: String,
+    latest_version: Option<String>,
+    available: bool,
+    release_url: Option<String>,
+    message: String,
+}
+
 struct CleanupDefinition {
     id: &'static str,
     name: &'static str,
@@ -253,15 +273,39 @@ fn age_bucket(days: Option<u64>) -> &'static str {
     }
 }
 
+fn path_is_excluded(path: &Path, exclusions: &[String]) -> bool {
+    let candidate = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    exclusions.iter().any(|excluded| {
+        let excluded = excluded
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        !excluded.is_empty()
+            && (candidate == excluded
+                || candidate
+                    .strip_prefix(&excluded)
+                    .is_some_and(|suffix| suffix.starts_with('\\')))
+    })
+}
+
 fn scan_directory(
     app: &AppHandle,
     path: &Path,
     cancel: &AtomicBool,
     percentage: u8,
     event: &str,
+    exclusions: &[String],
+    large_file_bytes: u64,
 ) -> DirAggregate {
     let mut result = DirAggregate::default();
-    let walker = walkdir::WalkDir::new(path).follow_links(false).into_iter();
+    let walker = walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !path_is_excluded(entry.path(), exclusions));
 
     for entry in walker {
         if cancel.load(Ordering::Relaxed) {
@@ -304,7 +348,7 @@ fn scan_directory(
                             .or_insert((0, 0));
                         bucket.0 = bucket.0.saturating_add(size);
                         bucket.1 += 1;
-                        if size >= LARGE_FILE_BYTES {
+                        if size >= large_file_bytes {
                             result.large_files.push(LargeFile {
                                 path: entry.path().to_string_lossy().into_owned(),
                                 name: entry.file_name().to_string_lossy().into_owned(),
@@ -439,8 +483,14 @@ fn build_age_buckets(values: HashMap<&'static str, (u64, u64)>) -> Vec<AgeBucket
     .collect()
 }
 
-fn run_scan(app: AppHandle, drive: String, cancel: Arc<AtomicBool>) -> Result<ScanResult, String> {
+fn run_scan(
+    app: AppHandle,
+    drive: String,
+    options: ScanOptions,
+    cancel: Arc<AtomicBool>,
+) -> Result<ScanResult, String> {
     let started = Instant::now();
+    let large_file_bytes = options.large_file_bytes.clamp(1024 * 1024, 1024_u64.pow(4));
     let usage = disk_usage(&drive)?;
     let root = PathBuf::from(format!("{}\\", drive));
     emit_progress(&app, "正在读取根目录", 3, Some(&root));
@@ -453,6 +503,9 @@ fn run_scan(app: AppHandle, drive: String, cancel: Arc<AtomicBool>) -> Result<Sc
         }
         if let Ok(entry) = entry {
             if let Ok(kind) = entry.file_type() {
+                if path_is_excluded(&entry.path(), &options.exclusions) {
+                    continue;
+                }
                 if kind.is_dir() {
                     roots.push(entry.path());
                 } else if kind.is_file() {
@@ -488,7 +541,7 @@ fn run_scan(app: AppHandle, drive: String, cancel: Arc<AtomicBool>) -> Result<Sc
                     .or_insert((0_u64, 0_u64));
                 bucket.0 = bucket.0.saturating_add(size);
                 bucket.1 += 1;
-                if size >= LARGE_FILE_BYTES {
+                if size >= large_file_bytes {
                     large_files.push(LargeFile {
                         path: path.to_string_lossy().into_owned(),
                         name: path
@@ -524,7 +577,15 @@ fn run_scan(app: AppHandle, drive: String, cancel: Arc<AtomicBool>) -> Result<Sc
             .unwrap_or_else(|| path.display().to_string());
         emit_progress(&app, format!("正在分析 {name}"), percentage, Some(path));
 
-        let aggregate = scan_directory(&app, path, &cancel, percentage, "scan-progress");
+        let aggregate = scan_directory(
+            &app,
+            path,
+            &cancel,
+            percentage,
+            "scan-progress",
+            &options.exclusions,
+            large_file_bytes,
+        );
         scanned_files += aggregate.files;
         scanned_dirs += aggregate.dirs;
         skipped_items += aggregate.skipped;
@@ -578,6 +639,7 @@ async fn start_scan(
     app: AppHandle,
     state: State<'_, AppState>,
     drive: String,
+    options: ScanOptions,
 ) -> Result<ScanResult, String> {
     let drive = normalize_drive(&drive)?;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -587,9 +649,10 @@ async fn start_scan(
             previous.store(true, Ordering::Relaxed);
         }
     }
-    let result = tauri::async_runtime::spawn_blocking(move || run_scan(app, drive, cancel))
-        .await
-        .map_err(|e| format!("扫描任务异常: {e}"))?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || run_scan(app, drive, options, cancel))
+            .await
+            .map_err(|e| format!("扫描任务异常: {e}"))?;
     if let Ok(mut active) = state.active_scan.lock() {
         *active = None;
     }
@@ -633,9 +696,11 @@ fn folder_guidance(path: &Path) -> (&'static str, &'static str) {
 fn run_folder_analysis(
     app: AppHandle,
     folder: String,
+    options: ScanOptions,
     cancel: Arc<AtomicBool>,
 ) -> Result<FolderAnalysis, String> {
     let started = Instant::now();
+    let large_file_bytes = options.large_file_bytes.clamp(1024 * 1024, 1024_u64.pow(4));
     let root = PathBuf::from(folder);
     if !root.is_absolute() || !root.is_dir() {
         return Err("请选择存在的绝对文件夹路径".into());
@@ -660,6 +725,9 @@ fn run_folder_analysis(
             return Err("文件夹分析已取消".into());
         }
         let path = entry.path();
+        if path_is_excluded(&path, &options.exclusions) {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let percentage = 4 + ((index * 91 / total_entries) as u8);
         emit_progress_event(
@@ -677,7 +745,15 @@ fn run_folder_analysis(
             }
         };
         let (size, files, dirs, kind) = if file_type.is_dir() {
-            let aggregate = scan_directory(&app, &path, &cancel, percentage, "folder-progress");
+            let aggregate = scan_directory(
+                &app,
+                &path,
+                &cancel,
+                percentage,
+                "folder-progress",
+                &options.exclusions,
+                large_file_bytes,
+            );
             skipped_items += aggregate.skipped;
             large_files.extend(aggregate.large_files);
             (aggregate.size, aggregate.files, aggregate.dirs, "directory")
@@ -686,7 +762,7 @@ fn run_folder_analysis(
                 Ok(metadata) => {
                     let size = metadata.len();
                     let modified_days = metadata_age_days(&metadata);
-                    if size >= LARGE_FILE_BYTES {
+                    if size >= large_file_bytes {
                         large_files.push(LargeFile {
                             path: path.to_string_lossy().into_owned(),
                             name: name.clone(),
@@ -746,6 +822,7 @@ async fn analyze_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    options: ScanOptions,
 ) -> Result<FolderAnalysis, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -754,10 +831,11 @@ async fn analyze_folder(
             previous.store(true, Ordering::Relaxed);
         }
     }
-    let result =
-        tauri::async_runtime::spawn_blocking(move || run_folder_analysis(app, path, cancel))
-            .await
-            .map_err(|e| format!("文件夹分析任务异常: {e}"))?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_folder_analysis(app, path, options, cancel)
+    })
+    .await
+    .map_err(|e| format!("文件夹分析任务异常: {e}"))?;
     if let Ok(mut active) = state.active_scan.lock() {
         *active = None;
     }
@@ -790,6 +868,7 @@ fn run_duplicate_scan(
     app: AppHandle,
     scope: String,
     min_size: u64,
+    exclusions: Vec<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<DuplicateReport, String> {
     let started = Instant::now();
@@ -808,7 +887,11 @@ fn run_duplicate_scan(
         2,
         Some(&root),
     );
-    for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+    let walker = walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !path_is_excluded(entry.path(), &exclusions));
+    for entry in walker {
         if cancel.load(Ordering::Relaxed) {
             return Err("重复文件检测已取消".into());
         }
@@ -909,6 +992,7 @@ async fn find_duplicates(
     state: State<'_, AppState>,
     path: String,
     min_size: u64,
+    exclusions: Vec<String>,
 ) -> Result<DuplicateReport, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -918,7 +1002,7 @@ async fn find_duplicates(
         }
     }
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_duplicate_scan(app, path, min_size, cancel)
+        run_duplicate_scan(app, path, min_size, exclusions, cancel)
     })
     .await
     .map_err(|e| format!("重复文件任务异常: {e}"))?;
@@ -926,6 +1010,38 @@ async fn find_duplicates(
         *active = None;
     }
     result
+}
+
+#[tauri::command]
+async fn scan_media(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    options: MediaScanOptions,
+) -> Result<MediaScanResult, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = state.active_scan.lock().map_err(|_| "扫描状态不可用")?;
+        if let Some(previous) = active.replace(cancel.clone()) {
+            previous.store(true, Ordering::Relaxed);
+        }
+    }
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        media::run_media_scan(app, path, options, cancel)
+    })
+    .await
+    .map_err(|error| format!("媒体扫描任务异常: {error}"))?;
+    if let Ok(mut active) = state.active_scan.lock() {
+        *active = None;
+    }
+    result
+}
+
+#[tauri::command]
+async fn recycle_media(paths: Vec<String>) -> Result<RecycleResult, String> {
+    tauri::async_runtime::spawn_blocking(move || media::recycle_media_files(paths))
+        .await
+        .map_err(|error| format!("回收站任务异常: {error}"))?
 }
 
 fn snapshot_file() -> Result<PathBuf, String> {
@@ -953,7 +1069,7 @@ fn write_snapshots(snapshots: &[ScanSnapshot]) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn save_snapshot(result: ScanResult) -> Result<ScanSnapshot, String> {
+fn save_snapshot(result: ScanResult, limit: usize) -> Result<ScanSnapshot, String> {
     let now = chrono::Utc::now();
     let snapshot = ScanSnapshot {
         id: format!(
@@ -974,11 +1090,12 @@ fn save_snapshot(result: ScanResult) -> Result<ScanSnapshot, String> {
     let mut snapshots = read_snapshots()?;
     snapshots.push(snapshot.clone());
     snapshots.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let limit = limit.clamp(2, 100);
     while snapshots
         .iter()
         .filter(|item| item.drive == snapshot.drive)
         .count()
-        > 30
+        > limit
     {
         if let Some(index) = snapshots
             .iter()
@@ -1000,6 +1117,21 @@ fn get_snapshots(drive: String) -> Result<Vec<ScanSnapshot>, String> {
         .collect::<Vec<_>>();
     snapshots.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(snapshots)
+}
+
+#[tauri::command]
+fn clear_snapshots(drive: Option<String>) -> Result<u64, String> {
+    let mut snapshots = read_snapshots()?;
+    let before = snapshots.len();
+    if let Some(drive) = drive {
+        let drive = normalize_drive(&drive)?;
+        snapshots.retain(|item| !item.drive.eq_ignore_ascii_case(&drive));
+    } else {
+        snapshots.clear();
+    }
+    let removed = before.saturating_sub(snapshots.len()) as u64;
+    write_snapshots(&snapshots)?;
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -1378,6 +1510,15 @@ fn open_in_explorer(path: String, select_file: bool) -> Result<(), String> {
         .map_err(|e| format!("无法打开资源管理器: {e}"))
 }
 
+#[tauri::command]
+fn open_media_file(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if !path.is_file() || !media::is_supported_media(&path) {
+        return Err("媒体文件不存在或格式不受支持".into());
+    }
+    shell_open(&path.to_string_lossy())
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1397,14 +1538,25 @@ fn format_size(bytes: u64) -> String {
     format!("{value:.1} {}", units[unit])
 }
 
-#[tauri::command]
-fn export_report(result: ScanResult) -> Result<String, String> {
-    let desktop = std::env::var("USERPROFILE")
+fn resolve_output_directory(value: Option<String>) -> Result<PathBuf, String> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        let path = PathBuf::from(value);
+        if path.is_absolute() && path.is_dir() {
+            return Ok(path);
+        }
+        return Err("报告保存位置不存在或不是绝对目录".into());
+    }
+    std::env::var("USERPROFILE")
         .map(PathBuf::from)
         .map(|path| path.join("Desktop"))
-        .map_err(|_| "无法定位桌面目录")?;
+        .map_err(|_| "无法定位桌面目录".into())
+}
+
+#[tauri::command]
+fn export_report(result: ScanResult, output_directory: Option<String>) -> Result<String, String> {
+    let directory = resolve_output_directory(output_directory)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let output = desktop.join(format!(
+    let output = directory.join(format!(
         "磁盘分析报告-{}-{stamp}.html",
         result.drive.replace(':', "")
     ));
@@ -1469,6 +1621,91 @@ fn export_report(result: ScanResult) -> Result<String, String> {
     Ok(output_string)
 }
 
+#[tauri::command]
+fn export_diagnostics(
+    output_directory: Option<String>,
+    settings: serde_json::Value,
+) -> Result<String, String> {
+    let directory = resolve_output_directory(output_directory)?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let output = directory.join(format!("磁盘空间分析器-诊断-{stamp}.json"));
+    let snapshot_path = snapshot_file()?;
+    let snapshots = read_snapshots().unwrap_or_default();
+    let payload = serde_json::json!({
+        "generatedAt": chrono::Local::now().to_rfc3339(),
+        "application": "磁盘空间分析器",
+        "version": env!("CARGO_PKG_VERSION"),
+        "architecture": std::env::consts::ARCH,
+        "operatingSystem": std::env::consts::OS,
+        "snapshotFile": snapshot_path,
+        "snapshotCount": snapshots.len(),
+        "settings": settings,
+    });
+    fs::write(
+        &output,
+        serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("诊断信息写入失败: {error}"))?;
+    Ok(output.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn check_for_updates(repository: String) -> Result<UpdateStatus, String> {
+    let valid = repository.split('/').count() == 2
+        && repository
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '/'));
+    if !valid {
+        return Err("更新仓库格式应为 owner/repository".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .map_err(|error| format!("当前版本格式错误: {error}"))?;
+        let url = format!("https://api.github.com/repos/{repository}/releases/latest");
+        let response = ureq::get(&url)
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", "disk-space-analyzer")
+            .timeout(Duration::from_secs(8))
+            .call();
+        let response = match response {
+            Ok(value) => value,
+            Err(ureq::Error::Status(404, _)) => {
+                return Ok(UpdateStatus {
+                    current_version: current.to_string(),
+                    latest_version: None,
+                    available: false,
+                    release_url: Some(format!("https://github.com/{repository}/releases")),
+                    message: "仓库尚未发布 GitHub Release".into(),
+                })
+            }
+            Err(error) => return Err(format!("无法连接 GitHub 更新服务: {error}")),
+        };
+        let payload: serde_json::Value = response
+            .into_json()
+            .map_err(|error| format!("更新响应解析失败: {error}"))?;
+        let tag = payload["tag_name"]
+            .as_str()
+            .ok_or("更新响应缺少版本号")?
+            .trim_start_matches(['v', 'V']);
+        let latest =
+            semver::Version::parse(tag).map_err(|error| format!("远程版本格式错误: {error}"))?;
+        let available = latest > current;
+        Ok(UpdateStatus {
+            current_version: current.to_string(),
+            latest_version: Some(latest.to_string()),
+            available,
+            release_url: payload["html_url"].as_str().map(str::to_owned),
+            message: if available {
+                format!("发现新版本 {latest}")
+            } else {
+                "当前已是最新版本".into()
+            },
+        })
+    })
+    .await
+    .map_err(|error| format!("更新检查任务异常: {error}"))?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1477,16 +1714,22 @@ fn main() {
             start_scan,
             analyze_folder,
             find_duplicates,
+            scan_media,
+            recycle_media,
             cancel_scan,
             get_drives,
             get_disk_usage,
             save_snapshot,
             get_snapshots,
+            clear_snapshots,
             analyze_cleanup,
             clean_items,
             open_in_explorer,
+            open_media_file,
             open_storage_settings,
-            export_report
+            export_report,
+            export_diagnostics,
+            check_for_updates
         ])
         .run(tauri::generate_context!())
         .expect("启动磁盘空间分析器失败");

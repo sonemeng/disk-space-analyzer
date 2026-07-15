@@ -1,6 +1,6 @@
 [package]
 name = "disk-analyzer"
-version = "5.1.0"
+version = "6.0.0"
 description = "Modern disk space analyzer with Vue 3 UI"
 authors = ["songmeng <songmeng@hotmail.com>"]
 license = "MIT"
@@ -15,6 +15,14 @@ sha2 = "0.10"
 walkdir = "2.5"
 chrono = "0.4"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+base64 = "0.22"
+img_hash = "3.2"
+image = { version = "0.23.14", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+lofty = "0.22"
+rayon = "1.10"
+trash = "5.2"
+semver = "1.0"
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

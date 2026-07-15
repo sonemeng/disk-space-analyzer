@@ -20,12 +20,14 @@
 └── docs/                 # 扩展文档
 ```
 
-### Tauri 5.1
+### Tauri 6.0
 
 ```
 tauri-app/
-├── src/App.vue                 # Vue 3 工作台与全部交互状态
-├── src-tauri/src/main.rs       # Rust 扫描器、系统集成和报告导出
+├── src/App.vue                 # Vue 3 工作台、磁盘视图与设置状态
+├── src/MediaCenter.vue         # 媒体管理、筛选、预览和回收站交互
+├── src-tauri/src/main.rs       # 磁盘扫描器、系统集成和报告导出
+├── src-tauri/src/media.rs      # 媒体属性、哈希、缩略图和回收站后端
 ├── src-tauri/tauri.conf.json   # 窗口与打包配置
 ├── package.json                # Vite/Tauri 前端工具链
 └── vite.config.ts
@@ -40,15 +42,29 @@ Rust 扫描在后台阻塞任务中执行，通过 `scan-progress` 事件更新�
 - `disk-analyzer-icon-scale`
 - `disk-analyzer-density`
 - `disk-analyzer-sidebar-collapsed`
+- `disk-analyzer-advanced-settings`
 
-这些设置仅影响界面表现，不参与扫描、清理或历史快照。
+高级设置会作为显式参数传入 Rust 命令；后端仍会验证范围、数量、路径和上下限，不能依赖前端绕过安全限制。
 
 深度分析事件和命令：
 
 - `duplicate-progress` / `find_duplicates`：大小预筛与 SHA-256 重复检测
-- `save_snapshot` / `get_snapshots`：本地 JSON 快照，按盘保留 30 条
+- `save_snapshot` / `get_snapshots`：本地 JSON 快照，按设置保留 10–100 条
 - `ScanResult.age_buckets`：扫描过程中同步累积文件年龄容量
 - `folder-progress` / `analyze_folder`：指定目录逐层下钻
+- `media-progress` / `scan_media`：媒体属性、图片感知哈希与缩略图
+- `recycle_media`：验证媒体文件后调用 Windows 回收站
+- `clear_snapshots`：清除指定盘或全部本地快照
+- `check_for_updates`：读取公开 GitHub Release 版本
+- `export_diagnostics`：导出本地版本、平台、设置与快照状态
+
+媒体依赖：
+
+- `img_hash` / `image`：图片解码、缩略图和感知哈希
+- `lofty`：音频属性解析
+- `rayon`：受设置控制的媒体并发分析
+- `trash`：Windows 回收站
+- `ureq` / `semver`：更新检查与版本比较
 
 ## 依赖
 

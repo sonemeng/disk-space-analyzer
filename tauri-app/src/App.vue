@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -7,6 +7,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   BarChart3,
+  Ban,
   CalendarClock,
   ChartNoAxesCombined,
   Check,
@@ -17,6 +18,7 @@ import {
   ExternalLink,
   FileSearch,
   FileText,
+  FolderCog,
   FolderOpen,
   FolderSearch,
   FolderTree,
@@ -25,19 +27,24 @@ import {
   History,
   Info,
   LayoutDashboard,
+  Library,
   LoaderCircle,
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
   Play,
   RefreshCw,
+  Recycle,
   Search,
   Settings,
+  SlidersHorizontal,
   ShieldCheck,
   Sparkles,
   Trash2,
+  Wrench,
   X,
 } from '@lucide/vue'
+import MediaCenter from './MediaCenter.vue'
 
 interface DiskUsage { total: number; used: number; free: number }
 interface DirectoryItem { path: string; name: string; size: number; fileCount: number; dirCount: number }
@@ -114,6 +121,22 @@ interface ScanSnapshot {
   fileTypes: CategoryItem[]
   ageBuckets: AgeBucket[]
 }
+interface UpdateStatus {
+  currentVersion: string
+  latestVersion?: string | null
+  available: boolean
+  releaseUrl?: string | null
+  message: string
+}
+interface AdvancedSettings {
+  exclusions: string[]
+  largeFileMb: number
+  scanThreads: number
+  snapshotLimit: number
+  reportDirectory: string
+  recyclePolicy: 'confirm' | 'direct'
+  autoCheckUpdates: boolean
+}
 
 const isTauri = '__TAURI_INTERNALS__' in window
 type ThemeId = 'ocean' | 'forest' | 'coral' | 'cherry' | 'graphite' | 'mintrose' | 'lavenderteal'
@@ -131,10 +154,20 @@ const themeOptions: Array<{ id: ThemeId; name: string; colors: string[] }> = [
 ]
 const activeTheme = ref<ThemeId>('ocean')
 const showSettings = ref(false)
-const settingsTab = ref<'appearance' | 'about'>('appearance')
+const settingsTab = ref<'appearance' | 'scanning' | 'system' | 'about'>('appearance')
 const fontScale = ref<FontScale>('standard')
 const iconScale = ref<IconScale>('standard')
 const uiDensity = ref<UiDensity>('comfortable')
+const exclusionPaths = ref<string[]>([])
+const largeFileMb = ref(100)
+const scanThreads = ref(6)
+const snapshotLimit = ref(30)
+const reportDirectory = ref('')
+const recyclePolicy = ref<'confirm' | 'direct'>('confirm')
+const autoCheckUpdates = ref(true)
+const updateStatus = ref<UpdateStatus | null>(null)
+const settingsBusy = ref('')
+const confirmClearHistory = ref(false)
 const sidebarCollapsed = ref(false)
 const drives = ref<string[]>([])
 const selectedDrive = ref('C:')
@@ -146,7 +179,7 @@ const folderAnalyzing = ref(false)
 const cleaning = ref(false)
 const loadingDrives = ref(true)
 const loadingCleanup = ref(false)
-const page = ref<'overview' | 'cleanup' | 'files' | 'insights'>('overview')
+const page = ref<'overview' | 'cleanup' | 'files' | 'insights' | 'media'>('overview')
 const analysisTab = ref<'duplicates' | 'history' | 'age'>('duplicates')
 const fileTab = ref<'directories' | 'files'>('directories')
 const query = ref('')
@@ -203,7 +236,11 @@ const longUnusedFiles = computed(() => result.value?.largeFiles.filter(file => (
 const latestSnapshot = computed(() => snapshots.value[snapshots.value.length - 1] ?? null)
 const previousSnapshot = computed(() => snapshots.value[snapshots.value.length - 2] ?? null)
 const snapshotDelta = computed(() => latestSnapshot.value && previousSnapshot.value ? latestSnapshot.value.used - previousSnapshot.value.used : 0)
-const pageTitle = computed(() => ({ overview: '空间概览', cleanup: '清理中心', files: '文件审查', insights: '深度分析' }[page.value]))
+const pageTitle = computed(() => ({ overview: '空间概览', cleanup: '清理中心', files: '文件审查', insights: '深度分析', media: '媒体管理' }[page.value]))
+const scanOptions = computed(() => ({
+  exclusions: exclusionPaths.value,
+  largeFileBytes: largeFileMb.value * 1024 * 1024,
+}))
 
 function formatSize(bytes = 0) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -234,6 +271,32 @@ function applyDensity(value: UiDensity) {
   uiDensity.value = value
   document.documentElement.dataset.density = value
   localStorage.setItem('disk-analyzer-density', value)
+}
+function advancedSettings(): AdvancedSettings {
+  return {
+    exclusions: exclusionPaths.value,
+    largeFileMb: largeFileMb.value,
+    scanThreads: scanThreads.value,
+    snapshotLimit: snapshotLimit.value,
+    reportDirectory: reportDirectory.value,
+    recyclePolicy: recyclePolicy.value,
+    autoCheckUpdates: autoCheckUpdates.value,
+  }
+}
+function loadAdvancedSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('disk-analyzer-advanced-settings') || '{}') as Partial<AdvancedSettings>
+    exclusionPaths.value = Array.isArray(saved.exclusions) ? saved.exclusions.filter(value => typeof value === 'string') : []
+    largeFileMb.value = [50, 100, 500, 1024].includes(saved.largeFileMb ?? 0) ? saved.largeFileMb! : 100
+    scanThreads.value = [2, 4, 6, 8].includes(saved.scanThreads ?? 0) ? saved.scanThreads! : 6
+    snapshotLimit.value = [10, 30, 60, 100].includes(saved.snapshotLimit ?? 0) ? saved.snapshotLimit! : 30
+    reportDirectory.value = typeof saved.reportDirectory === 'string' ? saved.reportDirectory : ''
+    recyclePolicy.value = saved.recyclePolicy === 'direct' ? 'direct' : 'confirm'
+    autoCheckUpdates.value = saved.autoCheckUpdates !== false
+  } catch { localStorage.removeItem('disk-analyzer-advanced-settings') }
+}
+function persistAdvancedSettings() {
+  localStorage.setItem('disk-analyzer-advanced-settings', JSON.stringify(advancedSettings()))
 }
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
@@ -326,10 +389,10 @@ async function startScan() {
   query.value = ''
   progress.value = { message: '正在启动完整扫描', percentage: 1 }
   try {
-    result.value = await invoke<ScanResult>('start_scan', { drive: selectedDrive.value })
+    result.value = await invoke<ScanResult>('start_scan', { drive: selectedDrive.value, options: scanOptions.value })
     usage.value = result.value.usage
     try {
-      await invoke<ScanSnapshot>('save_snapshot', { result: result.value })
+      await invoke<ScanSnapshot>('save_snapshot', { result: result.value, limit: snapshotLimit.value })
       await loadSnapshots()
     } catch (snapshotError) {
       notice.value = `扫描完成，但历史快照保存失败：${String(snapshotError)}`
@@ -431,7 +494,7 @@ async function scanDuplicates(path = `${selectedDrive.value}\\`) {
   duplicateProgress.value = { message: '正在启动重复文件检测', percentage: 1, currentPath: path }
   try {
     duplicateReport.value = isTauri
-      ? await invoke<DuplicateReport>('find_duplicates', { path, minSize: duplicateMinSize.value })
+      ? await invoke<DuplicateReport>('find_duplicates', { path, minSize: duplicateMinSize.value, exclusions: exclusionPaths.value })
       : buildPreviewDuplicates(path)
   } catch (value) {
     if (String(value).includes('已取消')) notice.value = '重复文件检测已取消。'
@@ -464,7 +527,7 @@ async function openPath(path: string, selectFile = false) {
 
 async function exportReport() {
   if (!result.value) return
-  try { notice.value = `报告已保存到 ${await invoke<string>('export_report', { result: result.value })}` }
+  try { notice.value = `报告已保存到 ${await invoke<string>('export_report', { result: result.value, outputDirectory: reportDirectory.value || null })}` }
   catch (value) { handleError(value) }
 }
 
@@ -522,7 +585,7 @@ async function analyzeFolder(path: string, rememberCurrent = true) {
   folderProgress.value = { message: '正在启动文件夹分析', percentage: 1, currentPath: path }
   try {
     folderAnalysis.value = isTauri
-      ? await invoke<FolderAnalysis>('analyze_folder', { path })
+      ? await invoke<FolderAnalysis>('analyze_folder', { path, options: scanOptions.value })
       : buildPreviewFolder(path)
   } catch (value) {
     if (String(value).includes('已取消')) notice.value = '文件夹分析已取消。'
@@ -551,7 +614,77 @@ async function leaveFolderAnalysis() {
   else folderAnalysis.value = null
 }
 
+async function addExclusion() {
+  if (!isTauri) {
+    const preview = 'C:\\Users\\User\\AppData\\Local\\Temp'
+    if (!exclusionPaths.value.includes(preview)) exclusionPaths.value = [...exclusionPaths.value, preview]
+    return
+  }
+  try {
+    const selected = await open({ directory: true, multiple: false, title: '选择扫描时排除的文件夹' })
+    if (typeof selected === 'string' && !exclusionPaths.value.some(value => value.toLocaleLowerCase() === selected.toLocaleLowerCase())) {
+      exclusionPaths.value = [...exclusionPaths.value, selected]
+    }
+  } catch (value) { handleError(value) }
+}
+
+function removeExclusion(path: string) {
+  exclusionPaths.value = exclusionPaths.value.filter(value => value !== path)
+}
+
+async function chooseReportDirectory() {
+  if (!isTauri) { reportDirectory.value = 'C:\\Users\\User\\Desktop'; return }
+  try {
+    const selected = await open({ directory: true, multiple: false, title: '选择报告和诊断信息保存位置' })
+    if (typeof selected === 'string') reportDirectory.value = selected
+  } catch (value) { handleError(value) }
+}
+
+async function clearLocalHistory() {
+  settingsBusy.value = 'history'
+  try {
+    const removed = isTauri ? await invoke<number>('clear_snapshots', { drive: null }) : snapshots.value.length
+    snapshots.value = []
+    confirmClearHistory.value = false
+    notice.value = `已清除 ${formatCount(removed)} 条本地扫描快照。`
+  } catch (value) { handleError(value) }
+  finally { settingsBusy.value = '' }
+}
+
+async function exportDiagnostics() {
+  settingsBusy.value = 'diagnostics'
+  try {
+    if (!isTauri) { notice.value = '界面预览：诊断信息将保存到所选报告目录。'; return }
+    const path = await invoke<string>('export_diagnostics', {
+      outputDirectory: reportDirectory.value || null,
+      settings: advancedSettings(),
+    })
+    notice.value = `诊断信息已保存到 ${path}`
+  } catch (value) { handleError(value) }
+  finally { settingsBusy.value = '' }
+}
+
+async function checkUpdates(silent = false) {
+  settingsBusy.value = 'update'
+  try {
+    updateStatus.value = isTauri
+      ? await invoke<UpdateStatus>('check_for_updates', { repository: 'sonemeng/disk-space-analyzer' })
+      : { currentVersion: '6.0.0', latestVersion: null, available: false, message: '仓库发布后即可检查更新' }
+    if (!silent) notice.value = updateStatus.value.message
+  } catch (value) {
+    updateStatus.value = { currentVersion: '6.0.0', available: false, message: String(value) }
+    if (!silent) handleError(value)
+  } finally { settingsBusy.value = '' }
+}
+
+watch(
+  [exclusionPaths, largeFileMb, scanThreads, snapshotLimit, reportDirectory, recyclePolicy, autoCheckUpdates],
+  persistAdvancedSettings,
+  { deep: true },
+)
+
 onMounted(async () => {
+  loadAdvancedSettings()
   const savedTheme = localStorage.getItem('disk-analyzer-theme') as ThemeId | null
   applyTheme(themeOptions.some(theme => theme.id === savedTheme) ? savedTheme! : 'ocean')
   const savedFont = localStorage.getItem('disk-analyzer-font-scale') as FontScale | null
@@ -569,6 +702,7 @@ onMounted(async () => {
   await loadDrives()
   await loadCleanup()
   await loadSnapshots()
+  if (autoCheckUpdates.value) await checkUpdates(true)
 })
 onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() })
 </script>
@@ -583,6 +717,7 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
         <button title="清理中心" :class="{ active: page === 'cleanup' }" @click="page = 'cleanup'"><Trash2 :size="17" /><span>清理中心</span><b v-if="cleanup?.safeBytes">{{ formatSize(cleanup.safeBytes) }}</b></button>
         <button title="文件审查" :class="{ active: page === 'files' }" @click="page = 'files'"><FileSearch :size="17" /><span>文件审查</span><b v-if="result">{{ result.largeFiles.length }}</b></button>
         <button title="深度分析" :class="{ active: page === 'insights' }" @click="page = 'insights'"><ChartNoAxesCombined :size="17" /><span>深度分析</span></button>
+        <button title="媒体管理" :class="{ active: page === 'media' }" @click="page = 'media'"><Library :size="17" /><span>媒体管理</span><b>NEW</b></button>
       </nav>
 
       <div class="sidebar-label sidebar-drive-title"><span>本机磁盘</span><button title="重新检测磁盘" :disabled="loadingDrives" @click="loadDrives"><RefreshCw :size="12" :class="{ spin: loadingDrives }" /></button></div>
@@ -598,17 +733,17 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
       <button class="settings-trigger" title="设置" @click="showSettings = true"><Settings :size="17" /><span><b>设置</b><small>{{ themeOptions.find(theme => theme.id === activeTheme)?.name }} · {{ fontScale === 'large' ? '大字号' : fontScale === 'small' ? '小字号' : '标准字号' }}</small></span><ChevronRight :size="15" /></button>
       <div class="safety-note"><ShieldCheck :size="17" /><div><b>默认只读</b><span>只有低风险白名单项目可在确认后清理</span></div></div>
       <div v-if="!isTauri" class="preview-badge"><Info :size="14" /> 界面预览</div>
-      <div class="version">TAURI EDITION · 5.1</div>
+      <div class="version">TAURI EDITION · 6.0</div>
     </aside>
 
     <main class="workspace">
       <header class="topbar">
-        <div><div class="eyebrow">{{ selectedDrive }}\ {{ pageTitle }}</div><h1>{{ pageTitle }}</h1></div>
+        <div><div class="eyebrow">{{ page === 'media' ? '本地媒体' : `${selectedDrive}\\` }} {{ pageTitle }}</div><h1>{{ pageTitle }}</h1></div>
         <div class="actions">
           <button v-if="result && page === 'overview'" class="button secondary" @click="exportReport"><Download :size="17" /> 导出报告</button>
           <button v-if="page === 'files'" class="button secondary" :disabled="folderAnalyzing" @click="chooseFolder"><FolderSearch :size="17" /> 选择文件夹</button>
           <button v-if="scanning || folderAnalyzing || duplicateScanning" class="button danger" @click="cancelScan"><CircleStop :size="17" /> 取消分析</button>
-          <button v-else class="button primary" :disabled="!selectedDrive" @click="startScan"><Play :size="17" fill="currentColor" /> {{ result ? '重新扫描' : '完整扫描' }}</button>
+          <button v-else-if="page !== 'media'" class="button primary" :disabled="!selectedDrive" @click="startScan"><Play :size="17" fill="currentColor" /> {{ result ? '重新扫描' : '完整扫描' }}</button>
         </div>
       </header>
 
@@ -631,7 +766,11 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
         <div class="current-path" :title="duplicateProgress.currentPath">{{ duplicateProgress.currentPath || '正在读取文件内容…' }}</div>
       </section>
 
-      <template v-if="page === 'overview'">
+      <template v-if="page === 'media'">
+        <MediaCenter :exclusions="exclusionPaths" :large-file-mb="largeFileMb" :scan-threads="scanThreads" :recycle-policy="recyclePolicy" />
+      </template>
+
+      <template v-else-if="page === 'overview'">
         <section class="metrics" aria-label="磁盘容量">
           <div class="metric"><div class="metric-icon coral"><Gauge :size="19" /></div><div><span>磁盘使用率</span><strong>{{ usedPercent }}%</strong><small>{{ currentUsage ? `${formatSize(currentUsage.used)} 已使用` : '正在读取容量' }}</small></div></div>
           <div class="metric"><div class="metric-icon blue"><HardDrive :size="19" /></div><div><span>总容量</span><strong>{{ currentUsage ? formatSize(currentUsage.total) : '—' }}</strong><small>{{ selectedDrive }} 本地磁盘</small></div></div>
@@ -794,7 +933,7 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
             <div class="panel-heading"><div><span class="panel-kicker">{{ selectedDrive }} 本地快照</span><h2>已用空间趋势</h2></div><div class="history-delta" :class="{ down: snapshotDelta < 0 }"><span>较上次</span><b>{{ snapshotDelta >= 0 ? '+' : '−' }}{{ formatSize(Math.abs(snapshotDelta)) }}</b></div></div>
             <div class="trend-chart"><div v-for="snapshot in snapshots" :key="snapshot.id" class="trend-column"><div class="trend-value">{{ Math.round(snapshot.used / snapshot.total * 100) }}%</div><div class="trend-track"><i :style="{ height: `${snapshot.used / snapshot.total * 100}%` }" /></div><span>{{ new Date(snapshot.createdAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) }}</span></div></div>
             <div class="history-list"><div v-for="snapshot in [...snapshots].reverse().slice(0, 6)" :key="snapshot.id"><span>{{ new Date(snapshot.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }}</span><b>{{ formatSize(snapshot.used) }}</b><small>{{ formatCount(snapshot.scannedFiles) }} 个文件</small><em>{{ snapshot.directories[0]?.name ?? '—' }} · {{ formatSize(snapshot.directories[0]?.size ?? 0) }}</em></div></div>
-            <div class="cleanup-footnote"><Info :size="16" /><span>每次完整扫描后自动保存一个快照，每个盘最多保留 30 次，数据仅保存在本机。</span></div>
+            <div class="cleanup-footnote"><Info :size="16" /><span>每次完整扫描后自动保存一个快照，每个盘最多保留 {{ snapshotLimit }} 次，数据仅保存在本机。</span></div>
           </section>
           <section v-else-if="!snapshotsLoading" class="empty-state analysis-empty"><div class="empty-visual"><History :size="40" /></div><h2>还没有 {{ selectedDrive }} 的历史快照</h2><p>完成一次整盘扫描后会自动记录；至少两次扫描才能看到空间变化。</p><button class="button primary" @click="page = 'overview'; startScan()"><Play :size="17" /> 开始完整扫描</button></section>
           <div v-else class="loading-state"><LoaderCircle :size="24" class="spin" /> 正在读取本地快照</div>
@@ -821,7 +960,7 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
     <div v-if="showSettings" class="settings-backdrop" @click.self="showSettings = false">
       <aside class="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header class="settings-head"><div><span class="panel-kicker">应用偏好</span><h2 id="settings-title">设置</h2></div><button class="icon-button" title="关闭设置" @click="showSettings = false"><X :size="19" /></button></header>
-        <nav class="settings-tabs" aria-label="设置分类"><button :class="{ active: settingsTab === 'appearance' }" @click="settingsTab = 'appearance'"><Palette :size="17" /> 外观</button><button :class="{ active: settingsTab === 'about' }" @click="settingsTab = 'about'"><Info :size="17" /> 关于</button></nav>
+        <nav class="settings-tabs" aria-label="设置分类"><button :class="{ active: settingsTab === 'appearance' }" @click="settingsTab = 'appearance'"><Palette :size="17" /> 外观</button><button :class="{ active: settingsTab === 'scanning' }" @click="settingsTab = 'scanning'"><SlidersHorizontal :size="17" /> 扫描</button><button :class="{ active: settingsTab === 'system' }" @click="settingsTab = 'system'"><Wrench :size="17" /> 系统</button><button :class="{ active: settingsTab === 'about' }" @click="settingsTab = 'about'"><Info :size="17" /> 关于</button></nav>
 
         <div v-if="settingsTab === 'appearance'" class="settings-content">
           <section class="setting-section"><div class="setting-title"><div><b>界面配色</b><small>浅色侧栏搭配高活力强调色</small></div><span>{{ themeOptions.find(theme => theme.id === activeTheme)?.name }}</span></div><div class="theme-options settings-theme-options"><button v-for="theme in themeOptions" :key="theme.id" :class="{ active: activeTheme === theme.id }" :aria-label="theme.name" @click="applyTheme(theme.id)"><i><em v-for="color in theme.colors" :key="color" :style="{ background: color }" /></i><span>{{ theme.name }}</span><Check v-if="activeTheme === theme.id" :size="14" /></button></div></section>
@@ -831,13 +970,38 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
           <p class="settings-footnote"><Check :size="15" /> 外观设置会自动保存在本机。</p>
         </div>
 
+        <div v-else-if="settingsTab === 'scanning'" class="settings-content">
+          <section class="setting-section"><div class="setting-title"><div><b>扫描排除目录</b><small>整盘、文件夹、重复文件与媒体分析都会跳过</small></div><button class="button secondary compact" @click="addExclusion"><FolderCog :size="15" /> 添加</button></div><div v-if="exclusionPaths.length" class="exclusion-list"><div v-for="path in exclusionPaths" :key="path"><Ban :size="15" /><span :title="path">{{ path }}</span><button title="移除排除目录" @click="removeExclusion(path)"><X :size="15" /></button></div></div><p v-else class="setting-empty">尚未排除任何目录</p></section>
+          <section class="setting-section"><div class="setting-title"><div><b>默认大文件阈值</b><small>目录排行、媒体和文件审查使用同一标准</small></div><span>{{ largeFileMb >= 1024 ? '1 GB' : `${largeFileMb} MB` }}</span></div><div class="preference-segments"><button v-for="value in [50, 100, 500, 1024]" :key="value" :class="{ active: largeFileMb === value }" @click="largeFileMb = value">{{ value === 1024 ? '1 GB' : `${value} MB` }}</button></div></section>
+          <section class="setting-section"><div class="setting-title"><div><b>扫描并发数</b><small>媒体解码和哈希任务使用的工作线程</small></div><span>{{ scanThreads }} workers</span></div><div class="preference-segments"><button v-for="value in [2, 4, 6, 8]" :key="value" :class="{ active: scanThreads === value }" @click="scanThreads = value">{{ value }}</button></div></section>
+          <section class="setting-section"><div class="setting-title"><div><b>快照保留数量</b><small>每个磁盘独立保留，较旧记录自动淘汰</small></div><span>{{ snapshotLimit }} 条 / 盘</span></div><div class="preference-segments"><button v-for="value in [10, 30, 60, 100]" :key="value" :class="{ active: snapshotLimit === value }" @click="snapshotLimit = value">{{ value }}</button></div></section>
+          <p class="settings-footnote"><Check :size="15" /> 扫描设置将在下次任务启动时生效。</p>
+        </div>
+
+        <div v-else-if="settingsTab === 'system'" class="settings-content">
+          <section class="setting-section"><div class="setting-title"><div><b>报告保存位置</b><small>HTML 报告和诊断信息默认写入此目录</small></div><button class="button secondary compact" @click="chooseReportDirectory"><FolderOpen :size="15" /> 选择</button></div><div class="setting-path"><span :title="reportDirectory">{{ reportDirectory || '桌面（系统默认）' }}</span><button v-if="reportDirectory" title="恢复默认位置" @click="reportDirectory = ''"><X :size="15" /></button></div></section>
+          <section class="setting-section"><div class="setting-title"><div><b>回收站策略</b><small>媒体文件始终进入 Windows 回收站，不会永久删除</small></div><Recycle :size="19" /></div><div class="preference-segments"><button :class="{ active: recyclePolicy === 'confirm' }" @click="recyclePolicy = 'confirm'">每次确认</button><button :class="{ active: recyclePolicy === 'direct' }" @click="recyclePolicy = 'direct'">直接移入回收站</button></div></section>
+          <section class="setting-section"><div class="setting-title"><div><b>启动时检查更新</b><small>通过 GitHub Releases 检查公开发布版本</small></div><button class="toggle-switch" role="switch" :aria-checked="autoCheckUpdates" :class="{ active: autoCheckUpdates }" @click="autoCheckUpdates = !autoCheckUpdates"><i /></button></div><div class="setting-action-row"><span :class="{ success: updateStatus && !updateStatus.available, update: updateStatus?.available }">{{ updateStatus?.message || '尚未检查更新' }}</span><button class="button secondary compact" :disabled="settingsBusy === 'update'" @click="checkUpdates()"><LoaderCircle v-if="settingsBusy === 'update'" :size="15" class="spin" /><RefreshCw v-else :size="15" /> 立即检查</button></div></section>
+          <section class="setting-section system-actions"><div><div><b>诊断信息</b><small>导出版本、平台、设置和快照状态，不包含文件内容</small></div><button class="button secondary compact" :disabled="settingsBusy === 'diagnostics'" @click="exportDiagnostics"><LoaderCircle v-if="settingsBusy === 'diagnostics'" :size="15" class="spin" /><Download v-else :size="15" /> 导出诊断</button></div><div><div><b>本地扫描历史</b><small>清除全部磁盘空间快照，不会删除文件</small></div><button class="button danger compact" @click="confirmClearHistory = true"><Trash2 :size="15" /> 清除历史</button></div></section>
+        </div>
+
         <div v-else class="settings-content about-content">
-          <div class="about-product"><span class="about-mark"><HardDrive :size="28" /></span><div><h3>磁盘空间分析器</h3><p>Windows 本地空间诊断与安全清理工具</p><b>版本 5.1.0</b></div></div>
+          <div class="about-product"><span class="about-mark"><HardDrive :size="28" /></span><div><h3>磁盘空间分析器</h3><p>Windows 本地空间诊断、媒体管理与安全清理工具</p><b>版本 6.0.0</b></div></div>
           <section class="about-section"><h4>系统架构</h4><dl><div><dt>桌面框架</dt><dd>Tauri 2</dd></div><div><dt>用户界面</dt><dd>Vue 3 + TypeScript</dd></div><div><dt>扫描引擎</dt><dd>Rust</dd></div><div><dt>运行平台</dt><dd>Windows 10 / 11 · 64 位</dd></div></dl></section>
           <section class="about-section"><h4>作者信息</h4><dl><div><dt>项目作者 / GitHub</dt><dd>songmeng@hotmail.com</dd></div><div><dt>软件许可</dt><dd>MIT License</dd></div></dl></section>
-          <section class="about-safety"><ShieldCheck :size="20" /><div><b>本地优先，默认只读</b><p>扫描、哈希和历史快照均在本机处理。只有固定低风险白名单项目会在二次确认后清理。</p></div></section>
+          <section class="about-safety"><ShieldCheck :size="20" /><div><b>本地优先，删除可恢复</b><p>扫描、哈希、缩略图和历史快照均在本机处理。媒体整理统一使用 Windows 回收站。</p></div></section>
         </div>
       </aside>
+    </div>
+
+    <div v-if="confirmClearHistory" class="modal-backdrop" @click.self="confirmClearHistory = false">
+      <section class="confirm-dialog" role="dialog" aria-modal="true" aria-label="确认清除扫描历史">
+        <button class="dialog-close" aria-label="关闭" @click="confirmClearHistory = false"><X :size="18" /></button>
+        <span class="dialog-icon history"><Trash2 :size="24" /></span>
+        <h2>清除全部本地扫描历史？</h2>
+        <p>将删除所有磁盘的空间快照与增长趋势记录。此操作不会删除磁盘中的任何文件。</p>
+        <div class="dialog-actions"><button class="button secondary" :disabled="settingsBusy === 'history'" @click="confirmClearHistory = false">取消</button><button class="button danger-solid" :disabled="settingsBusy === 'history'" @click="clearLocalHistory"><LoaderCircle v-if="settingsBusy === 'history'" :size="16" class="spin" /><Trash2 v-else :size="16" /> 确认清除</button></div>
+      </section>
     </div>
 
     <div v-if="confirmCleanup" class="modal-backdrop" @click.self="confirmCleanup = false">
@@ -883,6 +1047,7 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
 .brand-mark{box-shadow:0 7px 16px color-mix(in srgb,var(--accent) 28%,transparent)}
 .collapse-button{position:static!important;right:auto!important;top:auto!important;width:30px;height:30px;border:1px solid var(--sidebar-border)!important;background:#fff!important;color:var(--accent-ink)!important;border-radius:5px;display:grid;place-items:center;box-shadow:0 2px 8px #34405412}.collapse-button:hover{border-color:var(--accent)!important;background:var(--accent-soft)!important;color:var(--accent-ink)!important}
 .main-nav button,.drive-button{color:var(--sidebar-muted)}.main-nav button:hover,.drive-button:hover{background:var(--sidebar-hover);color:var(--sidebar-text);box-shadow:0 2px 9px #3440540d}.main-nav button.active,.drive-button.active{background:var(--sidebar-active);color:var(--accent-ink);box-shadow:inset 3px 0 0 var(--accent),0 3px 12px #34405414}.main-nav button b{background:#fff0f3;color:#d92d5b}.main-nav button:nth-child(1)>svg{color:#3182f6}.main-nav button:nth-child(2)>svg{color:#ff5d5d}.main-nav button:nth-child(3)>svg{color:#f59e0b}.main-nav button:nth-child(4)>svg{color:#8b5cf6}
+.main-nav button:nth-child(5)>svg{color:#12a47b}.sidebar{overflow-y:auto}
 .sidebar-label,.sidebar-drive-title button{color:var(--sidebar-muted)}.sidebar-drive-title button:hover{color:var(--accent)}.drive-button span small,.drive-loading{color:#7d8896}.drive-button>svg{color:#12a47b}
 .safety-note{color:#087355;background:#e8fbf4;border-color:#bdebdc}.safety-note span{color:#397b69}.version{color:#98a2b3}.preview-badge{color:#a15c00}
 .settings-trigger{width:100%;min-height:48px;border:0;background:transparent;color:var(--sidebar-muted);border-radius:5px;padding:7px 9px;margin-bottom:8px;display:grid;grid-template-columns:19px 1fr 16px;gap:9px;align-items:center;text-align:left}.settings-trigger:hover{background:#fff;color:var(--sidebar-text);box-shadow:0 2px 9px #3440540d}.settings-trigger>svg:first-child{color:#f97316}.settings-trigger b,.settings-trigger small{display:block}.settings-trigger b{color:#344054}.settings-trigger small{color:#7d8896;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -891,6 +1056,8 @@ onBeforeUnmount(() => { unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.() 
 
 .settings-backdrop{position:fixed;inset:0;background:#10182852;z-index:40;display:flex;justify-content:flex-end;backdrop-filter:blur(2px)}.settings-drawer{width:min(460px,100%);height:100%;overflow:auto;background:#fff;color:#273443;border-left:1px solid #dfe3e8;box-shadow:-18px 0 50px #1018282b;padding:24px}.settings-head{display:flex;align-items:flex-start;justify-content:space-between}.settings-head h2{margin:4px 0 0}.settings-tabs{display:grid;grid-template-columns:1fr 1fr;background:#f2f4f7;border-radius:6px;padding:3px;margin:22px 0}.settings-tabs button{height:38px;border:0;border-radius:4px;background:transparent;color:#667085;display:flex;align-items:center;justify-content:center;gap:8px;font-weight:650}.settings-tabs button.active{background:#fff;color:var(--accent-ink);box-shadow:0 2px 8px #10182814}.settings-content{display:grid;gap:0}.setting-section{padding:18px 0;border-bottom:1px solid #eaecf0}.setting-section:first-child{padding-top:4px}.setting-title{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:13px}.setting-title b,.setting-title small{display:block}.setting-title b{font-size:var(--ui-body-font)}.setting-title small{margin-top:4px;color:#7d8896}.setting-title>span{color:var(--accent-ink);font-size:var(--ui-small-font);white-space:nowrap}.settings-theme-options{grid-template-columns:1fr 1fr}.settings-theme-options button{height:56px}.preference-segments{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;background:#f2f4f7;border-radius:6px;padding:3px}.preference-segments button{height:36px;border:0;border-radius:4px;background:transparent;color:#667085;font-weight:600}.preference-segments button.active{background:#fff;color:var(--accent-ink);box-shadow:0 2px 7px #10182814}.icon-size-preview{width:36px;height:36px;border-radius:5px;background:var(--accent-soft);display:grid;place-items:center;color:var(--accent-ink)}.settings-footnote{display:flex;align-items:center;gap:8px;color:#4d7f6d;margin:16px 0 0!important}
 .about-product{display:flex;align-items:center;gap:15px;padding:6px 0 20px;border-bottom:1px solid #eaecf0}.about-mark{width:58px;height:58px;flex:none;border-radius:8px;background:var(--accent-gradient);color:var(--accent-contrast);display:grid;place-items:center;box-shadow:0 8px 20px color-mix(in srgb,var(--accent) 25%,transparent)}.about-product h3{margin:0 0 4px}.about-product p{margin:0 0 8px!important;color:#667085}.about-product b{font-size:var(--ui-small-font);color:var(--accent-ink);background:var(--accent-soft);padding:3px 7px;border-radius:3px}.about-section{padding:19px 0;border-bottom:1px solid #eaecf0}.about-section h4{margin:0 0 10px;font-size:var(--ui-body-font)}.about-section dl{margin:0}.about-section dl>div{min-height:34px;display:flex;justify-content:space-between;gap:16px;align-items:center}.about-section dt{color:#667085}.about-section dd{margin:0;text-align:right;color:#273443;font-weight:600}.about-safety{display:flex;align-items:flex-start;gap:11px;margin-top:20px;padding:14px;background:#effaf6;border:1px solid #ccecdf;border-radius:6px;color:#087355}.about-safety p{margin:4px 0 0!important;line-height:1.55;color:#397b69}
+
+.settings-drawer{width:min(540px,100%)}.settings-tabs{grid-template-columns:repeat(4,1fr)}.exclusion-list{display:grid;border:1px solid #e4e7eb;border-radius:5px;overflow:hidden}.exclusion-list>div{min-height:38px;padding:6px 9px;display:grid;grid-template-columns:17px minmax(0,1fr) 28px;gap:8px;align-items:center;border-bottom:1px solid #edf0f2;color:#667085}.exclusion-list>div:last-child{border:0}.exclusion-list span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#344054}.exclusion-list button,.setting-path button{border:0;background:transparent;color:#98a2b3;display:grid;place-items:center}.setting-empty{margin:0!important;padding:16px;border:1px dashed #d0d5dd;border-radius:5px;text-align:center;color:#98a2b3}.setting-path{min-height:40px;padding:7px 10px;border:1px solid #d7dce2;border-radius:5px;display:grid;grid-template-columns:minmax(0,1fr) 28px;align-items:center}.setting-path span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#475467}.toggle-switch{width:42px;height:24px;border:0;border-radius:12px;background:#d0d5dd;padding:3px;transition:background .16s}.toggle-switch i{display:block;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #10182833;transition:transform .16s}.toggle-switch.active{background:var(--accent)}.toggle-switch.active i{transform:translateX(18px)}.setting-action-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.setting-action-row>span{color:#7d8896}.setting-action-row>span.success{color:#218b68}.setting-action-row>span.update{color:#c94331;font-weight:650}.system-actions>div{min-height:65px;display:flex;align-items:center;justify-content:space-between;gap:15px;border-bottom:1px solid #edf0f2}.system-actions>div:last-child{border:0}.system-actions b,.system-actions small{display:block}.system-actions small{color:#7d8896;margin-top:4px}.dialog-icon.history{background:#fff0f0;color:#c94331}
 
 :root[data-density="compact"] .main-nav button{height:36px}:root[data-density="compact"] .drive-button{padding-top:7px;padding-bottom:7px}:root[data-density="compact"] td{height:46px}:root[data-density="compact"] .result-toolbar{height:52px}:root[data-density="compact"] .cleanup-row{min-height:72px}:root[data-density="compact"] .folder-analysis-row{min-height:74px}:root[data-density="compact"] .old-file-rows>div:not(.no-matches){height:52px}
 :root[data-density="comfortable"] .main-nav button{height:44px}:root[data-density="comfortable"] .drive-button{padding-top:11px;padding-bottom:11px}:root[data-density="comfortable"] td{height:58px}:root[data-density="comfortable"] .result-toolbar{height:64px}:root[data-density="comfortable"] .cleanup-row{min-height:92px}:root[data-density="comfortable"] .folder-analysis-row{min-height:96px}:root[data-density="comfortable"] .old-file-rows>div:not(.no-matches){height:64px}
