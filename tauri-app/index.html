@@ -5,9 +5,31 @@
   <link rel="icon" type="image/x-icon" href="/assets/icon.ico" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>磁盘空间分析器</title>
+  <style>
+    html, body, #app { margin: 0; min-height: 100%; background: #f3f5f7; }
+    .boot-error {
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      padding: 24px; color: #a52b2b; background: #fff0f0; border: 1px solid #ffcaca;
+      margin: 24px; border-radius: 8px; white-space: pre-wrap;
+    }
+  </style>
 </head>
 <body>
-  <div id="app"></div>
+  <div id="app"><div style="padding:24px;font-family:Segoe UI,Microsoft YaHei,sans-serif;color:#667085">正在加载界面…</div></div>
+  <script>
+    window.addEventListener('error', function (e) {
+      var el = document.createElement('div');
+      el.className = 'boot-error';
+      el.textContent = '界面加载失败: ' + (e.message || e.error || e);
+      document.body.appendChild(el);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var el = document.createElement('div');
+      el.className = 'boot-error';
+      el.textContent = '界面运行失败: ' + (e.reason && (e.reason.stack || e.reason.message || e.reason) || e.reason);
+      document.body.appendChild(el);
+    });
+  </script>
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

@@ -19,6 +19,31 @@ use tauri::{AppHandle, Emitter};
 const MAX_RETURNED_ITEMS: usize = 2_000;
 const MAX_THUMBNAILS: usize = 240;
 const MAX_SIMILAR_IMAGES: usize = 1_500;
+/// 感知哈希 / 模糊分析只处理最大的 N 张图，整盘扫描时避免解码海量缩略图
+const MAX_IMAGE_DEEP_ANALYSIS: usize = 2_500;
+/// 音频属性只解析最大的 N 个文件
+const MAX_AUDIO_DEEP_ANALYSIS: usize = 1_500;
+/// 视频 ffprobe 只解析最大的 N 个文件（外部进程很贵）
+const MAX_VIDEO_DEEP_ANALYSIS: usize = 400;
+/// 跳过明显非媒体的系统目录，加速整盘遍历
+const SKIP_DIR_NAMES: &[&str] = &[
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "$recycle.bin",
+    "system volume information",
+    "recovery",
+    "perflogs",
+    "boot",
+    "efi",
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".cache",
+    "appdata",
+];
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +51,20 @@ pub struct MediaScanOptions {
     pub exclusions: Vec<String>,
     pub large_file_bytes: u64,
     pub threads: usize,
+    /// all | image | video | audio — 只收集并深度分析所选类型
+    #[serde(default = "default_media_kinds")]
+    pub kinds: String,
+}
+
+fn default_media_kinds() -> String {
+    "all".into()
+}
+
+fn kind_allowed(kind: &str, filter: &str) -> bool {
+    match filter {
+        "image" | "video" | "audio" => kind == filter,
+        _ => true, // all / 未知 → 全开
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -377,13 +416,40 @@ pub fn run_media_scan(
     }
     let large_file_bytes = options.large_file_bytes.clamp(1024 * 1024, 1024_u64.pow(4));
     let threads = options.threads.clamp(1, 16);
+    let kinds_filter = options.kinds.to_ascii_lowercase();
     let mut skipped_items = 0_u64;
     let mut drafts = Vec::new();
-    emit_progress(&app, "正在查找图片、视频和音频", 2, Some(&root));
+    let mut seen_files = 0_u64;
+    let kind_label = match kinds_filter.as_str() {
+        "image" => "图片",
+        "video" => "视频",
+        "audio" => "音频",
+        _ => "图片、视频和音频",
+    };
+    emit_progress(
+        &app,
+        format!("正在查找{kind_label}"),
+        2,
+        Some(&root),
+    );
     let walker = walkdir::WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| !is_excluded(entry.path(), &options.exclusions));
+        .filter_entry(|entry| {
+            if is_excluded(entry.path(), &options.exclusions) {
+                return false;
+            }
+            if entry.file_type().is_dir() {
+                let name = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                if SKIP_DIR_NAMES.iter().any(|skip| *skip == name) {
+                    return false;
+                }
+            }
+            true
+        });
     for entry in walker {
         if cancel.load(Ordering::Relaxed) {
             return Err("媒体扫描已取消".into());
@@ -395,9 +461,23 @@ pub fn run_media_scan(
         if !entry.file_type().is_file() {
             continue;
         }
+        seen_files += 1;
+        if seen_files % 1_000 == 0 {
+            // 遍历阶段最多到 24%，避免“卡死”在固定百分比
+            let pct = (4 + (seen_files / 2_000).min(20)) as u8;
+            emit_progress(
+                &app,
+                format!("正在查找{kind_label}（已检查 {seen_files} 项，命中 {}）", drafts.len()),
+                pct,
+                Some(entry.path()),
+            );
+        }
         let Some((kind, format)) = media_kind(entry.path()) else {
             continue;
         };
+        if !kind_allowed(kind, &kinds_filter) {
+            continue;
+        }
         let Ok(metadata) = entry.metadata() else {
             skipped_items += 1;
             continue;
@@ -438,20 +518,54 @@ pub fn run_media_scan(
     }
     drafts.sort_by(|a, b| b.size.cmp(&a.size));
     let ffprobe_available = ffprobe_available();
-    let thumbnail_paths = drafts
-        .iter()
-        .filter(|item| item.kind == "image")
-        .take(MAX_THUMBNAILS)
-        .map(|item| item.path.clone())
-        .collect::<HashSet<_>>();
-    emit_progress(&app, "正在读取媒体属性", 28, None);
+
+    // 按体积优先：只对“大头”媒体做昂贵的解码 / 哈希 / ffprobe
+    let mut image_budget = MAX_IMAGE_DEEP_ANALYSIS;
+    let mut audio_budget = MAX_AUDIO_DEEP_ANALYSIS;
+    let mut video_budget = MAX_VIDEO_DEEP_ANALYSIS;
+    let mut deep_paths = HashSet::new();
+    let mut thumbnail_paths = HashSet::new();
+    for item in &drafts {
+        match item.kind {
+            "image" if image_budget > 0 => {
+                deep_paths.insert(item.path.clone());
+                if thumbnail_paths.len() < MAX_THUMBNAILS {
+                    thumbnail_paths.insert(item.path.clone());
+                }
+                image_budget -= 1;
+            }
+            "audio" if audio_budget > 0 => {
+                deep_paths.insert(item.path.clone());
+                audio_budget -= 1;
+            }
+            "video" if video_budget > 0 => {
+                deep_paths.insert(item.path.clone());
+                video_budget -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    emit_progress(
+        &app,
+        format!(
+            "正在读取媒体属性（深度分析 {} 项 / 共 {} 项）",
+            deep_paths.len(),
+            drafts.len()
+        ),
+        28,
+        None,
+    );
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .map_err(|error| format!("无法创建媒体分析线程池: {error}"))?;
+    let deep_total = deep_paths.len().max(1);
+    let deep_done = std::sync::atomic::AtomicUsize::new(0);
+    let progress_app = app.clone();
     pool.install(|| {
         drafts.par_iter_mut().for_each(|item| {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) || !deep_paths.contains(&item.path) {
                 return;
             }
             match item.kind {
@@ -485,6 +599,17 @@ pub fn run_media_scan(
                 }
                 _ => {}
             }
+            let done = deep_done.fetch_add(1, Ordering::Relaxed) + 1;
+            // 每完成若干项推一次进度，避免卡在 28%
+            if done == 1 || done % 25 == 0 || done == deep_total {
+                let pct = 28 + ((done * 30) / deep_total).min(30) as u8;
+                emit_progress(
+                    &progress_app,
+                    format!("正在读取媒体属性（{done}/{deep_total}）"),
+                    pct,
+                    Some(&item.path),
+                );
+            }
         });
     });
     if cancel.load(Ordering::Relaxed) {
@@ -494,17 +619,36 @@ pub fn run_media_scan(
     emit_progress(&app, "正在校验完全重复文件", 62, None);
     let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
     for (index, item) in drafts.iter().enumerate() {
-        by_size.entry(item.size).or_default().push(index);
+        // 过小文件几乎不值得做整文件 SHA-256；超大视频哈希极慢，上限避免“假死”
+        if item.size >= 64 * 1024 && item.size <= 2 * 1024_u64.pow(3) {
+            by_size.entry(item.size).or_default().push(index);
+        }
     }
     let candidates = by_size
         .into_values()
         .filter(|indices| indices.len() > 1)
         .flatten()
         .collect::<Vec<_>>();
+    let hash_total = candidates.len().max(1);
+    let hash_done = std::sync::atomic::AtomicUsize::new(0);
+    let hash_app = app.clone();
     let hashes = pool.install(|| {
         candidates
             .par_iter()
-            .filter_map(|index| hash_file(&drafts[*index].path, &cancel).map(|hash| (*index, hash)))
+            .filter_map(|index| {
+                let result = hash_file(&drafts[*index].path, &cancel).map(|hash| (*index, hash));
+                let done = hash_done.fetch_add(1, Ordering::Relaxed) + 1;
+                if done == 1 || done % 10 == 0 || done == hash_total {
+                    let pct = 62 + ((done * 16) / hash_total).min(16) as u8;
+                    emit_progress(
+                        &hash_app,
+                        format!("正在校验重复文件（{done}/{hash_total}）"),
+                        pct,
+                        Some(&drafts[*index].path),
+                    );
+                }
+                result
+            })
             .collect::<Vec<_>>()
     });
     let mut by_hash: HashMap<String, Vec<usize>> = HashMap::new();
@@ -526,6 +670,7 @@ pub fn run_media_scan(
     }
 
     emit_progress(&app, "正在查找相似图片", 82, None);
+    // 优先用已解码的大图做相似分析
     let image_indices = drafts
         .iter()
         .enumerate()
@@ -534,21 +679,43 @@ pub fn run_media_scan(
         .take(MAX_SIMILAR_IMAGES)
         .collect::<Vec<_>>();
     let mut union = UnionFind::new(image_indices.len());
-    for left in 0..image_indices.len() {
-        for right in left + 1..image_indices.len() {
-            let left_item = &drafts[image_indices[left]];
-            let right_item = &drafts[image_indices[right]];
-            if left_item.exact_group.is_some() && left_item.exact_group == right_item.exact_group {
-                continue;
-            }
-            let distance = left_item
-                .perceptual_hash
-                .as_ref()
-                .zip(right_item.perceptual_hash.as_ref())
-                .map(|(left_hash, right_hash)| left_hash.dist(right_hash))
-                .unwrap_or(u32::MAX);
-            if distance <= 10 {
-                union.union(left, right);
+    // 分桶：先比 hash 前缀，再算汉明距离，降低 O(n²)
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (pos, &draft_idx) in image_indices.iter().enumerate() {
+        if let Some(hash) = &drafts[draft_idx].perceptual_hash {
+            let key = hash
+                .as_bytes()
+                .get(0..8)
+                .map(|bytes| {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(bytes);
+                    u64::from_le_bytes(arr)
+                })
+                .unwrap_or(0);
+            // 粗桶：高 16 位，相近哈希大概率同桶
+            buckets.entry(key >> 48).or_default().push(pos);
+        }
+    }
+    for positions in buckets.into_values() {
+        for i in 0..positions.len() {
+            for j in i + 1..positions.len() {
+                let left = positions[i];
+                let right = positions[j];
+                let left_item = &drafts[image_indices[left]];
+                let right_item = &drafts[image_indices[right]];
+                if left_item.exact_group.is_some() && left_item.exact_group == right_item.exact_group
+                {
+                    continue;
+                }
+                let distance = left_item
+                    .perceptual_hash
+                    .as_ref()
+                    .zip(right_item.perceptual_hash.as_ref())
+                    .map(|(a, b)| a.dist(b))
+                    .unwrap_or(u32::MAX);
+                if distance <= 10 {
+                    union.union(left, right);
+                }
             }
         }
     }

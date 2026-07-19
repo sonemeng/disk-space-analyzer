@@ -1,7 +1,10 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+﻿#![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod app_cache_rules;
+mod dev_rules;
 mod media;
 mod registry;
+mod tool_ai_rules;
 
 use media::{MediaScanOptions, MediaScanResult, RecycleResult};
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, State};
 
 const LARGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
-const CLEANUP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const DEV_SCAN_MAX_DEPTH: usize = 8;
+const DEV_MIN_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Default)]
 struct AppState {
@@ -111,6 +115,20 @@ struct CleanupItem {
     file_count: u64,
     action: String,
     risk: String,
+    /// fixed | developer | toolai | app
+    category: String,
+    /// 规则 ID（工具/AI 规则包）；固定/开发项可为空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rule_id: Option<String>,
+    /// 规则包版本
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rulepack_version: Option<String>,
+    /// true 表示只读展示，禁止 clean_items
+    #[serde(default)]
+    readonly: bool,
+    /// 模型等：前端须强确认，后端须 strong_confirm
+    #[serde(default)]
+    requires_strong_confirm: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +137,15 @@ struct CleanupReport {
     items: Vec<CleanupItem>,
     safe_bytes: u64,
     review_bytes: u64,
+    developer_bytes: u64,
+    /// 工具/AI 缓存合计
+    #[serde(default)]
+    tool_ai_bytes: u64,
+    /// 应用/社交通讯缓存合计
+    #[serde(default)]
+    app_cache_bytes: u64,
+    #[serde(default)]
+    rulepack_version: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -127,7 +154,11 @@ struct CleanupResult {
     freed_bytes: u64,
     deleted_files: u64,
     failed_items: u64,
+    dry_run: bool,
+    skipped_hot: u64,
 }
+
+
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,12 +235,17 @@ struct UpdateStatus {
 }
 
 struct CleanupDefinition {
-    id: &'static str,
-    name: &'static str,
-    description: &'static str,
+    id: String,
+    name: String,
+    description: String,
     paths: Vec<PathBuf>,
     action: &'static str,
     risk: &'static str,
+    category: &'static str,
+    /// 开发者目录：整目录进回收站；固定白名单：按文件筛选
+    whole_dir: bool,
+    /// 已预计算体积（开发者扫描时填入，避免二次 WalkDir）
+    precomputed_size: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -661,37 +697,8 @@ async fn start_scan(
 }
 
 fn folder_guidance(path: &Path) -> (&'static str, &'static str) {
-    let value = path.to_string_lossy().to_ascii_lowercase();
-    if value.contains("\\windows")
-        || value.contains("\\program files")
-        || value.contains("\\programdata")
-        || value.contains("system32")
-    {
-        (
-            "protected",
-            "系统或程序目录，不建议手动删除；应使用卸载程序或 Windows 存储设置",
-        )
-    } else if [
-        "\\temp",
-        "\\cache",
-        "\\node_modules",
-        "\\target",
-        "\\.gradle",
-        "\\.npm",
-    ]
-    .iter()
-    .any(|part| value.contains(part))
-    {
-        (
-            "rebuildable",
-            "通常可以重新生成；关闭相关应用并确认项目不在使用后再处理",
-        )
-    } else {
-        (
-            "review",
-            "可能包含个人或项目数据，请先打开检查内容和最近修改时间",
-        )
-    }
+    let g = dev_rules::classify_path(path);
+    (g.risk.as_str(), g.recommendation)
 }
 
 fn run_folder_analysis(
@@ -1045,9 +1052,48 @@ async fn recycle_media(paths: Vec<String>) -> Result<RecycleResult, String> {
         .map_err(|error| format!("回收站任务异常: {error}"))?
 }
 
+/// 通用文件移入回收站（文件审查 / 重复文件等）；仅普通文件，非目录
 #[tauri::command]
-async fn analyze_registry() -> Result<registry::RegistryReport, String> {
-    tauri::async_runtime::spawn_blocking(registry::scan_registry)
+async fn recycle_paths(paths: Vec<String>) -> Result<RecycleResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if paths.is_empty() || paths.len() > 1_000 {
+            return Err("请选择 1 到 1000 个文件".into());
+        }
+        let mut recycled_files = 0_u64;
+        let mut recycled_bytes = 0_u64;
+        let mut failed_items = 0_u64;
+        for value in paths {
+            let path = PathBuf::from(&value);
+            if !path.is_absolute() || !path.is_file() {
+                failed_items += 1;
+                continue;
+            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            match trash::delete(&path) {
+                Ok(()) => {
+                    recycled_files += 1;
+                    recycled_bytes = recycled_bytes.saturating_add(size);
+                }
+                Err(_) => failed_items += 1,
+            }
+        }
+        Ok(RecycleResult {
+            recycled_files,
+            recycled_bytes,
+            failed_items,
+        })
+    })
+    .await
+    .map_err(|e| format!("回收站任务异常: {e}"))?
+}
+
+#[tauri::command]
+async fn analyze_registry(
+    app: AppHandle,
+    options: Option<registry::RegistryScanOptions>,
+) -> Result<registry::RegistryReport, String> {
+    let options = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || registry::scan_registry(options, Some(app)))
         .await
         .map_err(|error| format!("注册表检查任务异常: {error}"))?
 }
@@ -1057,6 +1103,32 @@ async fn repair_registry(ids: Vec<String>) -> Result<registry::RegistryRepairRes
     tauri::async_runtime::spawn_blocking(move || registry::repair_registry(ids))
         .await
         .map_err(|error| format!("注册表修复任务异常: {error}"))?
+}
+
+#[tauri::command]
+async fn list_registry_backups() -> Result<Vec<registry::RegistryBackupInfo>, String> {
+    tauri::async_runtime::spawn_blocking(registry::list_registry_backups)
+        .await
+        .map_err(|error| format!("读取注册表备份异常: {error}"))?
+}
+
+#[tauri::command]
+async fn create_registry_backup(
+    label: Option<String>,
+    destination_dir: Option<String>,
+) -> Result<registry::RegistryBackupInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        registry::create_full_registry_backup(label, destination_dir)
+    })
+    .await
+    .map_err(|error| format!("创建注册表备份异常: {error}"))?
+}
+
+#[tauri::command]
+async fn restore_registry_backup(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || registry::restore_registry_backup(path))
+        .await
+        .map_err(|error| format!("恢复注册表备份异常: {error}"))?
 }
 
 fn snapshot_file() -> Result<PathBuf, String> {
@@ -1212,7 +1284,51 @@ fn disk_usage(_drive: &str) -> Result<DiskUsage, String> {
     Err("磁盘容量查询仅支持 Windows".into())
 }
 
-fn cleanup_definitions() -> Vec<CleanupDefinition> {
+/// Chrome/Edge 多配置 + 现代缓存目录（不只 Default\\Cache）。
+fn browser_cache_paths(local: &Option<PathBuf>) -> Vec<PathBuf> {
+    let Some(local) = local else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for browser in [
+        local.join("Google").join("Chrome").join("User Data"),
+        local.join("Microsoft").join("Edge").join("User Data"),
+    ] {
+        if !browser.is_dir() {
+            continue;
+        }
+        // Default + Profile * + Guest Profile
+        let Ok(entries) = fs::read_dir(&browser) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_profile = name == "Default"
+                || name == "Guest Profile"
+                || name == "System Profile"
+                || name.starts_with("Profile ");
+            if !is_profile || !entry.path().is_dir() {
+                continue;
+            }
+            for sub in [
+                "Cache",
+                "Code Cache",
+                "GPUCache",
+                "Service Worker\\CacheStorage",
+                "GrShaderCache",
+                "ShaderCache",
+            ] {
+                let p = entry.path().join(sub);
+                if p.is_dir() {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn fixed_cleanup_definitions() -> Vec<CleanupDefinition> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let temp = std::env::var_os("TEMP").map(PathBuf::from);
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -1227,87 +1343,371 @@ fn cleanup_definitions() -> Vec<CleanupDefinition> {
 
     vec![
         CleanupDefinition {
-            id: "user-temp",
-            name: "用户临时文件",
-            description: "应用安装、解压和运行产生的过期临时文件",
+            id: "user-temp".into(),
+            name: "用户临时文件".into(),
+            description: "应用安装、解压和运行产生的过期临时文件（移入回收站，跳过 2 小时内热文件）"
+                .into(),
             paths: temp.into_iter().collect(),
             action: "safe",
             risk: "low",
+            category: "fixed",
+            whole_dir: false,
+            precomputed_size: None,
         },
         CleanupDefinition {
-            id: "browser-cache",
-            name: "浏览器缓存",
-            description: "Chrome 与 Edge 可重新下载的网页缓存，清理前建议关闭浏览器",
-            paths: [
-                path(
-                    &local,
-                    &["Google", "Chrome", "User Data", "Default", "Cache"],
-                ),
-                path(
-                    &local,
-                    &["Microsoft", "Edge", "User Data", "Default", "Cache"],
-                ),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            id: "browser-cache".into(),
+            name: "浏览器缓存".into(),
+            description: "Chrome/Edge 可重建网页缓存（含 Code Cache/GPUCache）；清理前请关闭浏览器".into(),
+            paths: browser_cache_paths(&local),
             action: "safe",
             risk: "low",
+            category: "fixed",
+            whole_dir: false,
+            precomputed_size: None,
         },
         CleanupDefinition {
-            id: "crash-dumps",
-            name: "程序崩溃转储",
-            description: "用于故障诊断的旧转储文件，不影响程序正常运行",
+            id: "crash-dumps".into(),
+            name: "程序崩溃转储".into(),
+            description: "用于故障诊断的旧转储文件，不影响程序正常运行".into(),
             paths: path(&local, &["CrashDumps"]).into_iter().collect(),
             action: "safe",
             risk: "low",
+            category: "fixed",
+            whole_dir: false,
+            precomputed_size: None,
         },
         CleanupDefinition {
-            id: "windows-temp",
-            name: "Windows 临时目录",
-            description: "超过 24 小时且未被系统占用的临时文件，无权限项目会自动跳过",
+            id: "windows-temp".into(),
+            name: "Windows 临时目录".into(),
+            description: "超过 6 小时且未被占用的临时文件；无权限项自动跳过".into(),
             paths: path(&windows, &["Temp"]).into_iter().collect(),
             action: "safe",
             risk: "low",
+            category: "fixed",
+            whole_dir: false,
+            precomputed_size: None,
         },
         CleanupDefinition {
-            id: "large-downloads",
-            name: "下载目录大文件",
-            description: "下载目录中超过 100 MB 的内容，需要确认用途后手动处理",
+            id: "large-downloads".into(),
+            name: "下载目录大文件".into(),
+            description: "下载目录中超过 100 MB 的内容，需要确认用途后手动处理".into(),
             paths: path(&profile, &["Downloads"]).into_iter().collect(),
             action: "review",
             risk: "medium",
+            category: "fixed",
+            whole_dir: false,
+            precomputed_size: None,
         },
         CleanupDefinition {
-            id: "windows-storage",
-            name: "Windows 系统清理",
-            description: "更新缓存、旧系统文件和回收站应交给 Windows 存储设置处理",
+            id: "windows-storage".into(),
+            name: "Windows 系统清理".into(),
+            description: "更新缓存、旧系统文件和回收站应交给 Windows 存储设置处理".into(),
             paths: Vec::new(),
             action: "system",
             risk: "medium",
+            category: "fixed",
+            whole_dir: false,
+            precomputed_size: None,
         },
     ]
 }
 
-fn file_age(metadata: &fs::Metadata) -> Duration {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .unwrap_or_default()
+/// 明确是代码仓库根的目录名（不扫 Documents，避免拖死启动）
+const PROJECT_DIR_NAMES: &[&str] = &[
+    "Projects",
+    "project",
+    "projects",
+    "code",
+    "Code",
+    "dev",
+    "Dev",
+    "workspace",
+    "workspaces",
+    "repos",
+    "github",
+    "GitHub",
+    "source",
+    "www",
+    "work",
+    "Work",
+];
+
+fn drive_letter(drive: &str) -> Option<char> {
+    let trimmed = drive.trim().trim_end_matches(['\\', '/']);
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let c = bytes[0] as char;
+    if c.is_ascii_alphabetic() {
+        Some(c.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+fn path_on_drive(path: &Path, drive: &str) -> bool {
+    let Some(want) = drive_letter(drive) else {
+        return false;
+    };
+    let value = path.to_string_lossy();
+    let bytes = value.as_bytes();
+    bytes.len() >= 2
+        && bytes[1] == b':'
+        && (bytes[0] as char).eq_ignore_ascii_case(&want)
+}
+
+/// 仅扫描指定盘上的开发相关根路径。
+/// 关键：绝不能把 `C:\Users` 整树当根深扫（极慢且易丢结果）；优先 Desktop/项目目录。
+fn developer_scan_roots(drive: &str) -> Vec<(PathBuf, usize)> {
+    let mut roots: Vec<(PathBuf, usize)> = Vec::new();
+    let drive_letter_str = drive.trim().trim_end_matches(['\\', '/']);
+    let drive_root = PathBuf::from(format!("{}\\", drive_letter_str));
+    if !drive_root.is_dir() {
+        return roots;
+    }
+
+    let skip_top = [
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "$recycle.bin",
+        "system volume information",
+        "recovery",
+        "perflogs",
+        "boot",
+        "efi",
+        // 禁止整树扫 Users；下面单独加 Desktop/Documents/Projects
+        "users",
+    ];
+
+    // 数据盘：盘根一级目录深扫（如 E:\Projects、E:\code）
+    // 系统盘：跳过 Users，只扫其它非系统一级目录（通常很少）
+    if let Ok(entries) = fs::read_dir(&drive_root) {
+        for entry in entries.flatten().take(120) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if skip_top.iter().any(|s| *s == name) {
+                continue;
+            }
+            roots.push((path, DEV_SCAN_MAX_DEPTH));
+        }
+    }
+
+    for name in PROJECT_DIR_NAMES {
+        let path = drive_root.join(name);
+        if path.is_dir() {
+            roots.push((path, DEV_SCAN_MAX_DEPTH + 1));
+        }
+    }
+
+    // 当前用户目录（C: 上开发项目几乎都在这里）
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        if path_on_drive(&profile, drive) {
+            for name in [
+                "Desktop",
+                "Documents",
+                "Downloads",
+                "Projects",
+                "project",
+                "projects",
+                "code",
+                "Code",
+                "dev",
+                "Dev",
+                "source",
+                "Source",
+                "workspace",
+                "workspaces",
+                "repos",
+                "github",
+                "GitHub",
+                "www",
+                "work",
+                "Work",
+            ] {
+                let path = profile.join(name);
+                if path.is_dir() {
+                    // Desktop 下常见 仓库/子目录/node_modules 或 src-tauri/target，深度要够
+                    let depth = if name.eq_ignore_ascii_case("Desktop")
+                        || name.eq_ignore_ascii_case("Documents")
+                        || name.eq_ignore_ascii_case("Downloads")
+                    {
+                        DEV_SCAN_MAX_DEPTH + 2
+                    } else {
+                        DEV_SCAN_MAX_DEPTH + 1
+                    };
+                    roots.push((path, depth));
+                }
+            }
+            // 用户主目录浅扫一层（覆盖直接放在用户根下的项目）
+            roots.push((profile, 3));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        if path_on_drive(&local, drive) {
+            for extra in [
+                local.join("npm-cache"),
+                local.join("Yarn"),
+                local.join("pnpm-cache"),
+                local.join("pip"),
+                local.join("Cargo"),
+            ] {
+                if extra.is_dir() {
+                    roots.push((extra, 2));
+                }
+            }
+        }
+    }
+
+    roots.sort_by(|a, b| a.0.cmp(&b.0));
+    roots.dedup_by(|a, b| a.0 == b.0);
+    roots
+}
+
+fn path_is_blacklisted(path: &Path, blacklist: &[String]) -> bool {
+    if blacklist.is_empty() {
+        return false;
+    }
+    let value = path.to_string_lossy().to_ascii_lowercase();
+    blacklist.iter().any(|entry| {
+        let needle = entry.trim().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        !needle.is_empty() && (value == needle || value.starts_with(&format!("{needle}\\")))
+    })
+}
+
+fn developer_cleanup_definitions(drive: &str, blacklist: &[String]) -> Vec<CleanupDefinition> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for (root, depth) in developer_scan_roots(drive) {
+        if path_is_blacklisted(&root, blacklist) {
+            continue;
+        }
+        let found = dev_rules::find_rebuildable_dirs(&root, depth, DEV_MIN_BYTES);
+        for entry in found {
+            if !path_on_drive(&entry.path, drive) {
+                continue;
+            }
+            if path_is_blacklisted(&entry.path, blacklist) {
+                continue;
+            }
+            // 列表阶段不做热过滤：正在用的项目也应能看见；删除时再跳过热目录
+            let key = entry.path.to_string_lossy().to_ascii_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            let hot = dev_rules::path_is_hot_shallow(&entry.path, dev_rules::HOT_PROTECT_AGE);
+            let id = format!("dev:{}", entry.path.to_string_lossy());
+            let hot_note = if hot {
+                "；目录最近有活动，执行清理时可能被热保护跳过"
+            } else {
+                ""
+            };
+            items.push(CleanupDefinition {
+                id,
+                name: format!(
+                    "{} · {}（{} 个文件）",
+                    entry.label, entry.name, entry.file_count
+                ),
+                description: format!(
+                    "{}（邻居验证通过；移入回收站可还原{}）",
+                    entry.tip, hot_note
+                ),
+                paths: vec![entry.path],
+                action: "safe",
+                risk: "low",
+                category: "developer",
+                whole_dir: true,
+                precomputed_size: Some((entry.size, entry.file_count)),
+            });
+        }
+    }
+    items.sort_by(|a, b| {
+        let sa = a.precomputed_size.map(|(s, _)| s).unwrap_or(0);
+        let sb = b.precomputed_size.map(|(s, _)| s).unwrap_or(0);
+        sb.cmp(&sa)
+    });
+    items.truncate(50);
+    items
+}
+
+fn cleanup_definitions(drive: &str, blacklist: &[String]) -> Vec<CleanupDefinition> {
+    let mut all: Vec<CleanupDefinition> = fixed_cleanup_definitions()
+        .into_iter()
+        .filter(|definition| {
+            if definition.paths.is_empty() {
+                // Windows 存储设置：仅系统盘显示
+                return drive.eq_ignore_ascii_case("C:");
+            }
+            definition
+                .paths
+                .iter()
+                .any(|path| path_on_drive(path, drive) && !path_is_blacklisted(path, blacklist))
+        })
+        .map(|mut definition| {
+            definition
+                .paths
+                .retain(|path| path_on_drive(path, drive) && !path_is_blacklisted(path, blacklist));
+            definition
+        })
+        .collect();
+    all.extend(developer_cleanup_definitions(drive, blacklist));
+    all
 }
 
 fn should_include_cleanup_file(id: &str, metadata: &fs::Metadata) -> bool {
+    if id.starts_with("dev:") {
+        return false;
+    }
+    let age = dev_rules::file_age(metadata);
     match id {
+        // 下载大文件：只按体积，人工复核
         "large-downloads" => metadata.len() >= LARGE_FILE_BYTES,
-        "user-temp" | "browser-cache" | "crash-dumps" | "windows-temp" => {
-            file_age(metadata) >= CLEANUP_MIN_AGE
-        }
+        // 浏览器缓存会被频繁访问，mtime 一直很新；只跳过 15 分钟内极热文件
+        "browser-cache" => age >= Duration::from_secs(15 * 60),
+        // 崩溃转储：1 小时后可清
+        "crash-dumps" => age >= Duration::from_secs(60 * 60),
+        // 系统/用户临时：6 小时（原 24h 过严 + 2h 热保护叠乘后常显示为空）
+        "user-temp" | "windows-temp" => age >= Duration::from_secs(6 * 60 * 60),
         _ => false,
     }
 }
 
 fn measure_cleanup(definition: &CleanupDefinition) -> (u64, u64) {
+    // 开发者项在发现阶段已计量；切勿在此处因“热目录”再清零，否则列表会只剩系统白名单
+    if let Some(pre) = definition.precomputed_size {
+        return pre;
+    }
+    if definition.whole_dir {
+        let mut size = 0_u64;
+        let mut files = 0_u64;
+        for root in &definition.paths {
+            if !root.is_dir() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(root)
+                .follow_links(false)
+                .max_open(32)
+                .into_iter()
+                .flatten()
+            {
+                if entry.file_type().is_file() {
+                    if let Ok(metadata) = entry.metadata() {
+                        size = size.saturating_add(metadata.len());
+                        files += 1;
+                    }
+                }
+                if files >= 80_000 {
+                    break;
+                }
+            }
+        }
+        return (size, files);
+    }
     let mut size = 0_u64;
     let mut files = 0_u64;
     for root in &definition.paths {
@@ -1323,7 +1723,7 @@ fn measure_cleanup(definition: &CleanupDefinition) -> (u64, u64) {
                 continue;
             }
             if let Ok(metadata) = entry.metadata() {
-                if should_include_cleanup_file(definition.id, &metadata) {
+                if should_include_cleanup_file(&definition.id, &metadata) {
                     size = size.saturating_add(metadata.len());
                     files += 1;
                 }
@@ -1333,14 +1733,38 @@ fn measure_cleanup(definition: &CleanupDefinition) -> (u64, u64) {
     (size, files)
 }
 
-fn analyze_cleanup_sync() -> CleanupReport {
+#[derive(Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CleanupOptions {
+    #[serde(default)]
+    blacklist: Vec<String>,
+    /// 活跃工作区路径前缀 → S0，不出现在工具/AI 列表
+    #[serde(default)]
+    protect_prefixes: Vec<String>,
+    /// P3: 清理含模型项时必须为 true
+    #[serde(default)]
+    strong_confirm: bool,
+}
+
+fn analyze_cleanup_sync(
+    drive: String,
+    blacklist: Vec<String>,
+    protect_prefixes: Vec<String>,
+) -> Result<CleanupReport, String> {
+    let drive = normalize_drive(&drive)?;
     let mut safe_bytes = 0_u64;
     let mut review_bytes = 0_u64;
+    let mut developer_bytes = 0_u64;
+    let mut tool_ai_bytes = 0_u64;
+    let mut app_cache_bytes = 0_u64;
     let mut items = Vec::new();
-    for definition in cleanup_definitions() {
+    for definition in cleanup_definitions(&drive, &blacklist) {
         let (size, file_count) = measure_cleanup(&definition);
         if definition.action == "safe" {
             safe_bytes = safe_bytes.saturating_add(size);
+            if definition.category == "developer" {
+                developer_bytes = developer_bytes.saturating_add(size);
+            }
         } else if definition.action == "review" {
             review_bytes = review_bytes.saturating_add(size);
         }
@@ -1350,14 +1774,72 @@ fn analyze_cleanup_sync() -> CleanupReport {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Windows 设置 > 系统 > 存储 > 临时文件".into());
         items.push(CleanupItem {
-            id: definition.id.into(),
-            name: definition.name.into(),
-            description: definition.description.into(),
+            id: definition.id.clone(),
+            name: definition.name.clone(),
+            description: definition.description.clone(),
             path,
             size,
             file_count,
             action: definition.action.into(),
             risk: definition.risk.into(),
+            category: definition.category.into(),
+            rule_id: None,
+            rulepack_version: None,
+            readonly: false,
+            requires_strong_confirm: false,
+        });
+    }
+    // P3: 工具/AI — B/C 默认可清；D 模型可清但 requires_strong_confirm
+    for hit in tool_ai_rules::discover_tool_ai(&drive, &protect_prefixes, &blacklist) {
+        tool_ai_bytes = tool_ai_bytes.saturating_add(hit.size);
+        let strong = hit.requires_strong_confirm;
+        let (action, risk) = if strong {
+            // 计入 review 展示「高成本」，但仍 action=safe 以便勾选进 clean 列表
+            review_bytes = review_bytes.saturating_add(hit.size);
+            ("safe", "medium")
+        } else {
+            safe_bytes = safe_bytes.saturating_add(hit.size);
+            ("safe", "low")
+        };
+        items.push(CleanupItem {
+            id: hit.id,
+            name: hit.name,
+            description: hit.description,
+            path: hit.path.to_string_lossy().into_owned(),
+            size: hit.size,
+            file_count: hit.file_count,
+            action: action.into(),
+            risk: risk.into(),
+            category: "toolai".into(),
+            rule_id: Some(hit.rule_id),
+            rulepack_version: Some(tool_ai_rules::RULEPACK_VERSION.into()),
+            readonly: false,
+            requires_strong_confirm: strong,
+        });
+    }
+    // 应用/社交通讯缓存
+    for hit in app_cache_rules::discover_app_caches(&drive, &blacklist) {
+        app_cache_bytes = app_cache_bytes.saturating_add(hit.size);
+        let strong = hit.requires_strong_confirm;
+        if strong {
+            review_bytes = review_bytes.saturating_add(hit.size);
+        } else {
+            safe_bytes = safe_bytes.saturating_add(hit.size);
+        }
+        items.push(CleanupItem {
+            id: hit.id,
+            name: hit.name,
+            description: hit.description,
+            path: hit.path.to_string_lossy().into_owned(),
+            size: hit.size,
+            file_count: hit.file_count,
+            action: "safe".into(),
+            risk: if strong { "medium" } else { "low" }.into(),
+            category: "app".into(),
+            rule_id: Some(hit.rule_id),
+            rulepack_version: Some(app_cache_rules::RULEPACK_VERSION.into()),
+            readonly: false,
+            requires_strong_confirm: strong,
         });
     }
     items.sort_by(|a, b| {
@@ -1366,34 +1848,128 @@ fn analyze_cleanup_sync() -> CleanupReport {
             "review" => 1,
             _ => 2,
         };
+        let cat_order = |category: &str| match category {
+            "fixed" => 0,
+            "developer" => 1,
+            "toolai" => 2,
+            "app" => 3,
+            _ => 4,
+        };
         action_order(&a.action)
             .cmp(&action_order(&b.action))
+            .then_with(|| cat_order(&a.category).cmp(&cat_order(&b.category)))
             .then_with(|| b.size.cmp(&a.size))
     });
-    CleanupReport {
+    Ok(CleanupReport {
         items,
         safe_bytes,
         review_bytes,
-    }
+        developer_bytes,
+        tool_ai_bytes,
+        app_cache_bytes,
+        rulepack_version: format!(
+            "tool:{}|app:{}",
+            tool_ai_rules::RULEPACK_VERSION,
+            app_cache_rules::RULEPACK_VERSION
+        ),
+    })
 }
 
 #[tauri::command]
-async fn analyze_cleanup() -> Result<CleanupReport, String> {
-    tauri::async_runtime::spawn_blocking(analyze_cleanup_sync)
-        .await
-        .map_err(|e| format!("清理分析任务异常: {e}"))
+async fn analyze_cleanup(
+    drive: String,
+    options: Option<CleanupOptions>,
+) -> Result<CleanupReport, String> {
+    let opts = options.unwrap_or_default();
+    let blacklist = opts.blacklist;
+    let protect_prefixes = opts.protect_prefixes;
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = analyze_cleanup_sync(drive, blacklist, protect_prefixes)?;
+
+        // 调试日志：便于确认开发项是否进入 IPC 返回
+        let dev_n = report
+            .items
+            .iter()
+            .filter(|i| i.category == "developer")
+            .count();
+        eprintln!(
+            "[cleanup] items={} developer={} developer_bytes={}",
+            report.items.len(),
+            dev_n,
+            report.developer_bytes
+        );
+        Ok(report)
+    })
+    .await
+    .map_err(|e| format!("清理分析任务异常: {e}"))?
 }
 
-fn clean_definition(definition: &CleanupDefinition) -> CleanupResult {
+fn trash_path(path: &Path) -> Result<(), String> {
+    trash::delete(path).map_err(|e| format!("移入回收站失败 {}: {e}", path.display()))
+}
+
+fn clean_definition(definition: &CleanupDefinition, dry_run: bool) -> CleanupResult {
     let mut result = CleanupResult {
         freed_bytes: 0,
         deleted_files: 0,
         failed_items: 0,
+        dry_run,
+        skipped_hot: 0,
     };
     if definition.action != "safe" {
         result.failed_items = 1;
         return result;
     }
+
+    if definition.whole_dir {
+        for root in &definition.paths {
+            if !root.is_dir() {
+                result.failed_items += 1;
+                continue;
+            }
+            // 再次邻居验证 + 仅高置信可清理 + 源码抽样拦截 + 热保护
+            if !dev_rules::is_cleanup_eligible_rebuildable(root) {
+                result.failed_items += 1;
+                continue;
+            }
+            if dev_rules::looks_like_source_tree(root) {
+                result.failed_items += 1;
+                continue;
+            }
+            if dev_rules::path_is_hot(root, dev_rules::HOT_PROTECT_AGE) {
+                result.skipped_hot += 1;
+                continue;
+            }
+            let mut size = 0_u64;
+            let mut files = 0_u64;
+            for entry in walkdir::WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .flatten()
+            {
+                if entry.file_type().is_file() {
+                    if let Ok(metadata) = entry.metadata() {
+                        size = size.saturating_add(metadata.len());
+                        files += 1;
+                    }
+                }
+            }
+            if dry_run {
+                result.freed_bytes = result.freed_bytes.saturating_add(size);
+                result.deleted_files = result.deleted_files.saturating_add(files.max(1));
+                continue;
+            }
+            match trash_path(root) {
+                Ok(()) => {
+                    result.freed_bytes = result.freed_bytes.saturating_add(size);
+                    result.deleted_files = result.deleted_files.saturating_add(files.max(1));
+                }
+                Err(_) => result.failed_items += 1,
+            }
+        }
+        return result;
+    }
+
     for root in &definition.paths {
         if !root.exists() {
             continue;
@@ -1407,21 +1983,29 @@ fn clean_definition(definition: &CleanupDefinition) -> CleanupResult {
                 result.failed_items += 1;
                 continue;
             };
-            if entry.path() == root {
+            if entry.path() == root.as_path() {
                 continue;
             }
             if entry.file_type().is_dir() {
-                let _ = fs::remove_dir(entry.path());
+                // 不主动删空目录；回收站按文件移入后系统可整理
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
                 result.failed_items += 1;
                 continue;
             };
-            if !should_include_cleanup_file(definition.id, &metadata) {
+            if !should_include_cleanup_file(&definition.id, &metadata) {
+                if dev_rules::file_age(&metadata) < dev_rules::HOT_PROTECT_AGE {
+                    result.skipped_hot += 1;
+                }
                 continue;
             }
-            match fs::remove_file(entry.path()) {
+            if dry_run {
+                result.freed_bytes = result.freed_bytes.saturating_add(metadata.len());
+                result.deleted_files += 1;
+                continue;
+            }
+            match trash_path(entry.path()) {
                 Ok(()) => {
                     result.freed_bytes = result.freed_bytes.saturating_add(metadata.len());
                     result.deleted_files += 1;
@@ -1433,38 +2017,245 @@ fn clean_definition(definition: &CleanupDefinition) -> CleanupResult {
     result
 }
 
+fn clean_app_path(
+    rule_id: &str,
+    path: &Path,
+    drive: &str,
+    blacklist: &[String],
+    dry_run: bool,
+) -> CleanupResult {
+    let mut result = CleanupResult {
+        freed_bytes: 0,
+        deleted_files: 0,
+        failed_items: 0,
+        dry_run,
+        skipped_hot: 0,
+    };
+    if !app_cache_rules::revalidate_app(rule_id, path, drive, blacklist) {
+        result.failed_items = 1;
+        return result;
+    }
+    if dev_rules::path_is_hot(path, dev_rules::HOT_PROTECT_AGE) {
+        result.skipped_hot = 1;
+        return result;
+    }
+    let mut size = 0_u64;
+    let mut files = 0_u64;
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                size = size.saturating_add(metadata.len());
+                files += 1;
+            }
+        }
+    }
+    if dry_run {
+        result.freed_bytes = size;
+        result.deleted_files = files.max(1);
+        return result;
+    }
+    match trash_path(path) {
+        Ok(()) => {
+            result.freed_bytes = size;
+            result.deleted_files = files.max(1);
+        }
+        Err(_) => result.failed_items = 1,
+    }
+    result
+}
+
+fn clean_toolai_path(
+    rule_id: &str,
+    path: &Path,
+    drive: &str,
+    protect_prefixes: &[String],
+    blacklist: &[String],
+    dry_run: bool,
+) -> CleanupResult {
+    let mut result = CleanupResult {
+        freed_bytes: 0,
+        deleted_files: 0,
+        failed_items: 0,
+        dry_run,
+        skipped_hot: 0,
+    };
+    if !tool_ai_rules::revalidate_cleanable(rule_id, path, drive, protect_prefixes, blacklist) {
+        result.failed_items = 1;
+        return result;
+    }
+    if dev_rules::path_is_hot(path, dev_rules::HOT_PROTECT_AGE) {
+        result.skipped_hot = 1;
+        return result;
+    }
+    // 拒绝误伤：目录名像源码树（极少见于包缓存，双保险）
+    if dev_rules::looks_like_source_tree(path) {
+        result.failed_items = 1;
+        return result;
+    }
+    let mut size = 0_u64;
+    let mut files = 0_u64;
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                size = size.saturating_add(metadata.len());
+                files += 1;
+            }
+        }
+    }
+    if dry_run {
+        result.freed_bytes = size;
+        result.deleted_files = files.max(1);
+        return result;
+    }
+    match trash_path(path) {
+        Ok(()) => {
+            result.freed_bytes = size;
+            result.deleted_files = files.max(1);
+        }
+        Err(_) => result.failed_items = 1,
+    }
+    result
+}
+
 #[tauri::command]
-async fn clean_items(ids: Vec<String>) -> Result<CleanupResult, String> {
+async fn clean_items(
+    drive: String,
+    ids: Vec<String>,
+    dry_run: Option<bool>,
+    options: Option<CleanupOptions>,
+) -> Result<CleanupResult, String> {
+    let dry_run = dry_run.unwrap_or(false);
+    let opts = options.unwrap_or_default();
+    let blacklist = opts.blacklist;
+    let protect_prefixes = opts.protect_prefixes;
+    let strong_confirm = opts.strong_confirm;
     tauri::async_runtime::spawn_blocking(move || {
+        let drive = normalize_drive(&drive)?;
         let requested: std::collections::HashSet<_> = ids.into_iter().collect();
-        let definitions = cleanup_definitions();
-        let known: std::collections::HashSet<_> = definitions
+        if requested.is_empty() {
+            return Err("清理请求为空".into());
+        }
+        let tool_hits = tool_ai_rules::discover_tool_ai(&drive, &protect_prefixes, &blacklist);
+        let app_hits = app_cache_rules::discover_app_caches(&drive, &blacklist);
+        let needs_strong = requested.iter().any(|id| {
+            tool_hits
+                .iter()
+                .any(|h| h.id == *id && h.requires_strong_confirm)
+                || app_hits
+                    .iter()
+                    .any(|h| h.id == *id && h.requires_strong_confirm)
+                || tool_ai_rules::parse_toolai_id(id)
+                    .map(|(rid, _)| {
+                        tool_hits
+                            .iter()
+                            .any(|h| h.rule_id == rid && h.requires_strong_confirm)
+                    })
+                    .unwrap_or(false)
+                || app_cache_rules::parse_app_id(id)
+                    .map(|(rid, _)| {
+                        app_hits
+                            .iter()
+                            .any(|h| h.rule_id == rid && h.requires_strong_confirm)
+                    })
+                    .unwrap_or(false)
+        });
+        if needs_strong && !strong_confirm && !dry_run {
+            return Err(
+                "所选含模型/应用等高成本项，请勾选风险确认并完成确认词后再执行".into(),
+            );
+        }
+        let definitions = cleanup_definitions(&drive, &blacklist);
+        let mut known: std::collections::HashSet<_> = definitions
             .iter()
             .filter(|definition| definition.action == "safe")
-            .map(|definition| definition.id.to_string())
+            .map(|definition| definition.id.clone())
             .collect();
-        if requested.is_empty() || !requested.is_subset(&known) {
+        for id in &requested {
+            if id.starts_with("toolai:") {
+                if let Some((rule_id, path)) = tool_ai_rules::parse_toolai_id(id) {
+                    if tool_ai_rules::revalidate_cleanable(
+                        &rule_id,
+                        &path,
+                        &drive,
+                        &protect_prefixes,
+                        &blacklist,
+                    ) {
+                        known.insert(id.clone());
+                    }
+                }
+            } else if id.starts_with("app:") {
+                if let Some((rule_id, path)) = app_cache_rules::parse_app_id(id) {
+                    if app_cache_rules::revalidate_app(&rule_id, &path, &drive, &blacklist) {
+                        known.insert(id.clone());
+                    }
+                }
+            }
+        }
+        if !requested.is_subset(&known) {
             return Err("清理请求包含无效或不可自动处理的项目".into());
         }
         let mut total = CleanupResult {
             freed_bytes: 0,
             deleted_files: 0,
             failed_items: 0,
+            dry_run,
+            skipped_hot: 0,
         };
-        for definition in definitions
-            .iter()
-            .filter(|definition| requested.contains(definition.id))
-        {
-            let result = clean_definition(definition);
-            total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
-            total.deleted_files += result.deleted_files;
-            total.failed_items += result.failed_items;
+        for id in &requested {
+            if id.starts_with("toolai:") {
+                if let Some((rule_id, path)) = tool_ai_rules::parse_toolai_id(id) {
+                    let result = clean_toolai_path(
+                        &rule_id,
+                        &path,
+                        &drive,
+                        &protect_prefixes,
+                        &blacklist,
+                        dry_run,
+                    );
+                    total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
+                    total.deleted_files += result.deleted_files;
+                    total.failed_items += result.failed_items;
+                    total.skipped_hot += result.skipped_hot;
+                } else {
+                    total.failed_items += 1;
+                }
+                continue;
+            }
+            if id.starts_with("app:") {
+                if let Some((rule_id, path)) = app_cache_rules::parse_app_id(id) {
+                    let result =
+                        clean_app_path(&rule_id, &path, &drive, &blacklist, dry_run);
+                    total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
+                    total.deleted_files += result.deleted_files;
+                    total.failed_items += result.failed_items;
+                    total.skipped_hot += result.skipped_hot;
+                } else {
+                    total.failed_items += 1;
+                }
+                continue;
+            }
+            if let Some(definition) = definitions.iter().find(|d| d.id == *id) {
+                let result = clean_definition(definition, dry_run);
+                total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
+                total.deleted_files += result.deleted_files;
+                total.failed_items += result.failed_items;
+                total.skipped_hot += result.skipped_hot;
+            }
         }
         Ok(total)
     })
     .await
     .map_err(|e| format!("清理任务异常: {e}"))?
 }
+
 
 #[cfg(windows)]
 fn shell_open(target: &str) -> Result<(), String> {
@@ -1731,8 +2522,12 @@ fn main() {
             find_duplicates,
             scan_media,
             recycle_media,
+            recycle_paths,
             analyze_registry,
             repair_registry,
+            list_registry_backups,
+            create_registry_backup,
+            restore_registry_backup,
             cancel_scan,
             get_drives,
             get_disk_usage,
@@ -1780,16 +2575,94 @@ mod tests {
 
     #[test]
     fn only_low_risk_cleanup_items_are_automatic() {
-        let definitions = cleanup_definitions();
+        let definitions = fixed_cleanup_definitions();
         let automatic: Vec<_> = definitions
             .iter()
             .filter(|definition| definition.action == "safe")
-            .map(|definition| definition.id)
+            .map(|definition| definition.id.as_str())
             .collect();
         assert!(automatic.contains(&"user-temp"));
         assert!(automatic.contains(&"browser-cache"));
-        assert!(!automatic.contains(&"large-downloads"));
-        assert!(!automatic.contains(&"windows-storage"));
+        assert!(!automatic.iter().any(|id| *id == "large-downloads"));
+        assert!(!automatic.iter().any(|id| *id == "windows-storage"));
+    }
+
+    #[test]
+    fn cleanup_items_are_scoped_to_selected_drive() {
+        assert!(path_on_drive(Path::new("C:\\Users\\a\\AppData\\Local\\Temp"), "C:"));
+        assert!(!path_on_drive(Path::new("C:\\Users\\a\\AppData\\Local\\Temp"), "E:"));
+        assert!(path_on_drive(Path::new("E:\\Projects\\app\\node_modules"), "E:"));
+        assert!(!path_on_drive(Path::new("E:\\Projects\\app\\node_modules"), "C:"));
+        // E: 上不应出现固定白名单（路径都在 C:）
+        let e_defs = cleanup_definitions("E:", &[]);
+        assert!(e_defs.iter().all(|d| d.category == "developer" || d.paths.iter().all(|p| path_on_drive(p, "E:"))));
+        assert!(!e_defs.iter().any(|d| d.id == "user-temp" || d.id == "browser-cache"));
+    }
+
+    #[test]
+    fn developer_roots_prefer_user_project_dirs_not_all_users() {
+        let roots = developer_scan_roots("C:");
+        // 不得把 C:\Users 整树当作深扫根
+        assert!(
+            !roots.iter().any(|(p, depth)| {
+                let s = p.to_string_lossy().to_ascii_lowercase();
+                (s.ends_with("\\users") || s.ends_with("\\users\\")) && *depth >= 4
+            }),
+            "must not deep-scan entire C:\\Users"
+        );
+        let has_desktop = roots.iter().any(|(p, _)| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("Desktop"))
+                .unwrap_or(false)
+        });
+        assert!(has_desktop, "C: roots should include user Desktop when present");
+    }
+
+    #[test]
+    fn developer_cleanup_finds_desktop_node_modules_on_this_machine() {
+        let defs = developer_cleanup_definitions("C:", &[]);
+        let dev: Vec<_> = defs.iter().filter(|d| d.category == "developer").collect();
+        eprintln!("developer items on C: = {}", dev.len());
+        for d in dev.iter().take(12) {
+            eprintln!("  {} -> {}", d.name, d.paths[0].display());
+        }
+        // 本机 Desktop 上确有带 package.json 的 node_modules
+        assert!(
+            !dev.is_empty(),
+            "expected developer cleanup items under Desktop/projects on this machine"
+        );
+        assert!(dev.iter().any(|d| {
+            d.paths.iter().any(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().eq_ignore_ascii_case("node_modules")
+                        || n.to_string_lossy().eq_ignore_ascii_case("target")
+                        || n.to_string_lossy().eq_ignore_ascii_case(".next"))
+                    .unwrap_or(false)
+            })
+        }));
+    }
+
+    #[test]
+    fn analyze_cleanup_report_includes_developer_items() {
+        let report = analyze_cleanup_sync("C:".into(), vec![], vec![]).unwrap();
+        let dev: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.category == "developer")
+            .collect();
+        eprintln!(
+            "report items={} developer={} developer_bytes={}",
+            report.items.len(),
+            dev.len(),
+            report.developer_bytes
+        );
+        for i in dev.iter().take(8) {
+            eprintln!("  {} size={} path={}", i.name, i.size, i.path);
+        }
+        assert!(
+            !dev.is_empty() && report.developer_bytes > 0,
+            "analyze_cleanup_sync must surface developer items with non-zero size"
+        );
     }
 
     #[test]
@@ -1798,9 +2671,10 @@ mod tests {
             folder_guidance(Path::new("C:\\Windows\\System32")).0,
             "protected"
         );
+        // 无邻居标记时不得标可重建
         assert_eq!(
             folder_guidance(Path::new("D:\\project\\node_modules")).0,
-            "rebuildable"
+            "review"
         );
         assert_eq!(
             folder_guidance(Path::new("C:\\Users\\me\\Documents")).0,
@@ -1851,3 +2725,4 @@ mod tests {
         fs::remove_dir(directory).unwrap();
     }
 }
+
