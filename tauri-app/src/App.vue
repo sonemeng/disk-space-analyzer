@@ -56,6 +56,7 @@ import {
   kindLabel,
   loadActivityLog,
   migrateLegacyMessageLog,
+  removeActivity,
   setDetailedActivityLogEnabled,
   type ActivityEntry,
   type ActivityKind,
@@ -168,6 +169,7 @@ interface AdvancedSettings {
   autoCheckUpdates: boolean
 }
 
+const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '6.2.2'
 const isTauri = '__TAURI_INTERNALS__' in window
 type ThemeId = 'ocean' | 'forest' | 'coral' | 'cherry' | 'graphite' | 'mintrose' | 'lavenderteal'
 type FontScale = 'small' | 'standard' | 'large'
@@ -406,27 +408,36 @@ const filteredActivityLog = computed(() => {
 })
 const unreadBadge = computed(() => Math.min(unreadActivityCount.value, 99))
 const shadeOpen = computed(() => statusPanel.value === 'notify' || statusPanel.value === 'quick')
+/** 通知中心列表：最多 12 条 */
+const shadeNotifyItems = computed(() => activityLog.value.slice(0, 12))
 const shadeStyle = computed(() => {
-  // 全宽下拉帘：从侧栏右缘铺到窗口右缘，高度接近全屏
+  // 全宽下拉帘：跟手拖动 + 松手弹性动画（非拖动时用 CSS transition）
   const sidebarWidth = sidebarCollapsed.value ? 72 : 232
   if (typeof document !== 'undefined') {
     document.documentElement.style.setProperty('--shade-left', `${sidebarWidth}px`)
   }
   const open = shadeOpen.value
-  const pulling = pullDragging.value && pullDistance.value > 0
+  const dragging = pullDragging.value
   const travel = typeof window !== 'undefined' ? Math.min(window.innerHeight * 0.92, window.innerHeight - 24) : 640
-  const yExpr = open
-    ? '0px'
-    : pulling
-      ? `${Math.min(pullDistance.value, travel) - travel}px`
-      : '-105%'
+  let dist = 0
+  if (dragging) {
+    dist = Math.max(0, Math.min(travel, pullDistance.value))
+  } else if (open) {
+    dist = travel
+  }
+  const visible = open || dragging || dist > 0
   return {
     left: `${sidebarWidth}px`,
     right: '0px',
     width: 'auto',
     maxHeight: '92vh',
-    height: open || pulling ? `${travel}px` : undefined,
-    transform: `translateY(${yExpr})`,
+    height: visible ? `${travel}px` : undefined,
+    transform: `translateY(${visible ? dist - travel : -travel}px)`,
+    transition: dragging
+      ? 'none'
+      : 'transform .32s cubic-bezier(.22,.9,.3,1), opacity .28s ease',
+    opacity: visible ? 1 : 0,
+    pointerEvents: (visible ? 'auto' : 'none') as 'auto' | 'none',
   }
 })
 const latestSnapshot = computed(() => snapshots.value[snapshots.value.length - 1] ?? null)
@@ -524,7 +535,6 @@ function detectProjectRoot(path: string): { key: string; name: string; root: str
   const full = normalizeWinPath(path)
   const parts = full.split('\\').filter(Boolean)
   if (parts.length < 2) return null
-  const markers = new Set(['package.json', 'cargo.toml', 'pom.xml', 'go.mod', '.git', 'pyproject.toml', 'composer.json', 'mix.exs'])
   // 从路径向上猜项目根：含 projects/code 等下的第一层子目录
   const lower = parts.map(p => p.toLowerCase())
   const hubIdx = lower.findIndex(p => ['projects', 'project', 'code', 'repos', 'repo', 'dev', 'work', 'workspace', 'github', 'src'].includes(p))
@@ -551,7 +561,6 @@ function detectProjectRoot(path: string): { key: string; name: string; root: str
       return { key: root.toLowerCase(), name, root }
     }
   }
-  void markers
   return null
 }
 
@@ -727,12 +736,25 @@ function openActivityLog(filter: 'all' | ActivityKind = 'all') {
   showMessageLog.value = true
 }
 
-function openActivityDetail(item: ActivityEntry) {
+function openActivityDetail(item: ActivityEntry, opts?: { removeFromLog?: boolean }) {
   selectedActivity.value = item
   markActivitySeen()
+  // 通知中心点击：从列表移除（活动日志里也不再显示该条）
+  if (opts?.removeFromLog !== false && statusPanel.value === 'notify') {
+    removeActivity(item.id)
+    refreshActivityLog()
+  }
   statusPanel.value = 'none'
   pullDistance.value = 0
   showMessageLog.value = true
+}
+
+/** 清空通知中心列表（静默，不写入新通知） */
+function clearShadeNotifications() {
+  clearActivityLog()
+  refreshActivityLog()
+  unreadActivityCount.value = 0
+  persistUnreadCount()
 }
 
 function openLatestNoticeDetail() {
@@ -768,37 +790,62 @@ function openActivityInSettings() {
   refreshActivityLog()
 }
 
+function shadeTravel() {
+  return Math.min(window.innerHeight * 0.92, window.innerHeight - 24)
+}
+
+function detachPullListeners() {
+  window.removeEventListener('pointermove', onPullMove)
+  window.removeEventListener('pointerup', onPullEnd)
+  window.removeEventListener('pointercancel', onPullEnd)
+}
+
+/** 安卓式：打开后可在帘底部空白/底栏/手柄处上滑关闭；关闭时顶部下拉打开 */
 function onPullStart(event: PointerEvent, side?: 'left' | 'right') {
   if (showSettings.value || showMessageLog.value || confirmCleanup.value || confirmRecycleFiles.value) return
   const target = event.target as HTMLElement | null
-  if (target?.closest('.status-shade, .modal-backdrop, .settings-backdrop, button, input, select, a, .table-wrap, .dialog-actions')) {
-    if (!target?.closest('.pull-edge, .shade-handle, .status-shade')) return
+  const open = statusPanel.value === 'notify' || statusPanel.value === 'quick'
+  if (open) {
+    // 列表条目/控件不抢拖动手势；底栏、手柄、标题空白、帘底部可上滑
+    if (target?.closest('button, a, input, select, textarea, .status-item, .quick-link, .toggle-switch, .chip-btn, .quick-toggle, .quick-slider')) return
+    if (!target?.closest('.shade-handle, .shade-head, .shade-foot, .shade-dismiss, .status-shade, .pull-edge')) return
+  } else {
+    if (target?.closest('.modal-backdrop, .settings-backdrop, button, input, select, a, .table-wrap, .dialog-actions')) {
+      if (!target?.closest('.pull-edge')) return
+    }
+    if (event.clientY > 56 && !target?.closest('.pull-edge')) return
   }
-  // 全屏时顶部更大触发带（约 72px），方便下拉
-  if (event.clientY > 72 && !target?.closest('.pull-edge, .status-shade, .shade-handle')) return
   const width = window.innerWidth || 1200
   const sidebarWidth = sidebarCollapsed.value ? 72 : 232
-  // 工作区左半 = 通知，右半 = 快捷设置
   const contentX = event.clientX - sidebarWidth
   const contentW = Math.max(320, width - sidebarWidth)
-  pullSide.value = side || (contentX < contentW / 2 ? 'left' : 'right')
+  if (open) {
+    pullSide.value = statusPanel.value === 'quick' ? 'right' : 'left'
+  } else {
+    pullSide.value = side || (contentX < contentW / 2 ? 'left' : 'right')
+  }
   pullActive = true
   pullDragging.value = true
   pullStartY = event.clientY
-  const travel = Math.min(window.innerHeight * 0.92, window.innerHeight - 24)
-  const open = statusPanel.value === 'notify' || statusPanel.value === 'quick'
+  const travel = shadeTravel()
   pullDistance.value = open ? travel : 0
   try {
     (event.currentTarget as HTMLElement)?.setPointerCapture?.(event.pointerId)
   } catch { /* ignore */ }
+  detachPullListeners()
+  window.addEventListener('pointermove', onPullMove, { passive: false })
+  window.addEventListener('pointerup', onPullEnd)
+  window.addEventListener('pointercancel', onPullEnd)
 }
 
 function onPullMove(event: PointerEvent) {
   if (!pullActive) return
+  event.preventDefault?.()
   const delta = event.clientY - pullStartY
-  const travel = Math.min(window.innerHeight * 0.92, window.innerHeight - 24)
+  const travel = shadeTravel()
   const open = statusPanel.value === 'notify' || statusPanel.value === 'quick'
   if (open) {
+    // 上滑 delta 为负 → 距离减小 → 帘跟手上移
     pullDistance.value = Math.max(0, Math.min(travel, travel + delta))
   } else {
     pullDistance.value = Math.max(0, Math.min(travel, delta))
@@ -808,14 +855,20 @@ function onPullMove(event: PointerEvent) {
 function onPullEnd() {
   if (!pullActive) return
   pullActive = false
-  pullDragging.value = false
-  const travel = Math.min(window.innerHeight * 0.92, window.innerHeight - 24)
+  const travel = shadeTravel()
   const open = statusPanel.value === 'notify' || statusPanel.value === 'quick'
+  const dist = pullDistance.value
+  detachPullListeners()
+  // 先结束 dragging，让 transition 接管弹性动画
+  pullDragging.value = false
   if (open) {
-    // 上推超过约 1/3 高度则关闭
-    if (pullDistance.value < travel * 0.66) closeStatusPanel()
-    else pullDistance.value = travel
-  } else if (pullDistance.value > Math.min(120, travel * 0.12)) {
+    // 轻推上滑超过约 12% 即关闭（安卓感）
+    if (dist < travel * 0.88) {
+      closeStatusPanel()
+    } else {
+      pullDistance.value = travel
+    }
+  } else if (dist > Math.min(72, travel * 0.07)) {
     statusPanel.value = pullSide.value === 'right' ? 'quick' : 'notify'
     if (statusPanel.value === 'notify') {
       refreshActivityLog()
@@ -1909,10 +1962,10 @@ async function checkUpdates(silent = false) {
   try {
     updateStatus.value = isTauri
       ? await invoke<UpdateStatus>('check_for_updates', { repository: 'sonemeng/disk-space-analyzer' })
-      : { currentVersion: '6.2.0', latestVersion: null, available: false, message: '仓库发布后即可检查更新' }
+      : { currentVersion: APP_VERSION, latestVersion: null, available: false, message: '当前为预览模式，无法检查更新' }
     if (!silent) showNotice(updateStatus.value.message)
   } catch (value) {
-    updateStatus.value = { currentVersion: '6.2.0', available: false, message: String(value) }
+    updateStatus.value = { currentVersion: APP_VERSION, available: false, message: String(value) }
     if (!silent) handleError(value)
   } finally { settingsBusy.value = '' }
 }
@@ -2011,14 +2064,14 @@ onBeforeUnmount(() => {
         <button title="清理中心" :class="{ active: page === 'cleanup' }" @click="page = 'cleanup'"><Trash2 :size="17" /><span>清理中心</span><b v-if="hasScanForDrive && cleanup?.safeBytes">{{ formatSize(cleanup.safeBytes) }}</b></button>
         <button title="文件审查" :class="{ active: page === 'files' }" @click="page = 'files'"><FileSearch :size="17" /><span>文件审查</span><b v-if="result">{{ result.largeFiles.length }}</b></button>
         <button title="深度分析" :class="{ active: page === 'insights' }" @click="page = 'insights'"><ChartNoAxesCombined :size="17" /><span>深度分析</span></button>
-        <button title="媒体管理" :class="{ active: page === 'media' }" @click="openMediaCenter"><Library :size="17" /><span>媒体管理</span><b v-if="mediaNew">NEW</b></button>
+        <button title="媒体管理" :class="{ active: page === 'media' }" @click="openMediaCenter"><Library :size="17" /><span>媒体管理</span><b v-if="mediaNew">新</b></button>
         <button title="注册表检查" :class="{ active: page === 'registry' }" @click="page = 'registry'"><Database :size="17" /><span>注册表检查</span></button>
       </nav>
 
       <div class="sidebar-label sidebar-drive-title"><span>本机磁盘</span><button title="重新检测磁盘" :disabled="loadingDrives" @click="loadDrives"><RefreshCw :size="12" :class="{ spin: loadingDrives }" /></button></div>
       <div class="drive-list" :aria-busy="loadingDrives">
         <button v-for="drive in drives" :key="drive" class="drive-button" :title="`本地磁盘 ${drive}`" :class="{ active: selectedDrive === drive }" :disabled="scanning" @click="selectDrive(drive)">
-          <HardDrive :size="16" /><span><b>本地磁盘 {{ drive }}</b><small>{{ drive }}\</small></span><i v-if="selectedDrive === drive" />
+          <HardDrive :size="16" /><span><b>本地磁盘 {{ drive }}</b></span><i v-if="selectedDrive === drive" />
         </button>
         <div v-if="loadingDrives" class="drive-loading"><RefreshCw :size="15" class="spin" /> 正在检测磁盘</div>
         <div v-else-if="!drives.length" class="drive-loading">未检测到磁盘</div>
@@ -2028,7 +2081,7 @@ onBeforeUnmount(() => {
       <button class="settings-trigger" title="设置" @click="showSettings = true"><Settings :size="17" /><span><b>设置</b><small>{{ themeOptions.find(theme => theme.id === activeTheme)?.name }} · {{ fontScale === 'large' ? '大字号' : fontScale === 'small' ? '小字号' : '标准字号' }}</small></span><ChevronRight :size="15" /></button>
       <div class="safety-note"><ShieldCheck :size="17" /><div><b>默认只读</b><span>只有低风险白名单项目可在确认后清理</span></div></div>
       <div v-if="!isTauri" class="preview-badge"><Info :size="14" /> 界面预览</div>
-      <div class="version">TAURI EDITION · 6.2.1</div>
+      <div class="version">TAURI EDITION · {{ APP_VERSION }}</div>
     </aside>
 
     <main class="workspace">
@@ -2064,30 +2117,34 @@ onBeforeUnmount(() => {
       >
         <div class="shade-handle" @pointerdown="onPullStart($event, statusPanel === 'quick' ? 'right' : 'left')" @pointermove="onPullMove" @pointerup="onPullEnd" @pointercancel="onPullEnd" />
         <template v-if="statusPanel !== 'quick' && !(pullDragging && pullSide === 'right' && statusPanel === 'none')">
-          <header class="shade-head">
+          <header class="shade-head" @pointerdown="onPullStart($event, 'left')">
             <div>
               <b>通知中心</b>
-              <small>窗口顶栏左侧下拉 · 点击条目看详情 · 查看后角标清除{{ unreadBadge ? ` · 未读 ${unreadBadge}` : '' }}</small>
+              <small v-if="unreadBadge">未读 {{ unreadBadge }}</small>
             </div>
-            <button class="text-button" @click="openActivityLog()">全部</button>
+            <div class="shade-head-actions" @pointerdown.stop>
+              <button type="button" class="text-button" :disabled="!shadeNotifyItems.length" @click="clearShadeNotifications">清除全部</button>
+              <button type="button" class="text-button" @click="openActivityLog()">全部</button>
+            </div>
           </header>
           <div class="status-list">
-            <button v-for="item in activityLog.slice(0, 12)" :key="item.id" type="button" class="status-item" :class="item.kind" @click="openActivityDetail(item)">
+            <button v-for="item in shadeNotifyItems" :key="item.id" type="button" class="status-item" :class="item.kind" @click="openActivityDetail(item)">
               <div><b>{{ kindLabel(item.kind) }}</b><span>{{ new Date(item.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }}</span></div>
               <p>{{ item.title }}</p>
               <small v-if="item.detail" class="status-item-detail">{{ item.detail.split('\n')[0] }}</small>
             </button>
-            <div v-if="!activityLog.length" class="no-matches">暂无通知 · 在窗口顶部左半边下拉可打开</div>
           </div>
-          <footer class="shade-foot"><button class="button secondary compact" @click="openActivityInSettings">设置中的活动日志</button></footer>
+          <div class="shade-dismiss" @pointerdown="onPullStart($event, 'left')" />
+          <footer class="shade-foot" @pointerdown="onPullStart($event, 'left')">
+            <button class="button secondary compact" @pointerdown.stop @click="openActivityInSettings">设置中的活动日志</button>
+          </footer>
         </template>
         <template v-else>
-          <header class="shade-head shade-head-quick">
+          <header class="shade-head shade-head-quick" @pointerdown="onPullStart($event, 'right')">
             <div>
               <b>快捷设置</b>
-              <small>右侧下拉打开 · 全宽布局适配窗口/全屏 · 完整选项仍在「全部设置」</small>
             </div>
-            <div class="shade-head-actions">
+            <div class="shade-head-actions" @pointerdown.stop>
               <button class="button secondary compact" @click="showSettings = true; statusPanel = 'none'">全部设置</button>
             </div>
           </header>
@@ -2127,6 +2184,7 @@ onBeforeUnmount(() => {
               </div>
             </section>
           </div>
+          <div class="shade-dismiss" @pointerdown="onPullStart($event, 'right')" />
         </template>
       </section>
 
@@ -2269,7 +2327,7 @@ onBeforeUnmount(() => {
 
           <section class="cleanup-list panel">
             <div class="cleanup-toolbar">
-              <div><h2>清理建议</h2><p>分类查看 · 全选仅作用于当前分类 · 强确认项需手动勾选</p></div>
+              <div><h2>清理建议</h2><p title="切换上方分类后，「选择本类可处理」只作用于当前分类">强确认项需手动勾选，不会被本类全选带上</p></div>
               <div class="cleanup-actions">
                 <button class="text-button" :disabled="!selectableInTab.length" @click="toggleAllSafe">{{ allTabSelectableSelected ? '取消本类选择' : '选择本类可处理' }}</button>
                 <button class="button secondary" :disabled="!selectedCleanup.length || cleaning || previewingCleanup" @click="previewCleanup"><LoaderCircle v-if="previewingCleanup" :size="16" class="spin" /><Search v-else :size="16" /> 预览释放量</button>
@@ -2327,7 +2385,7 @@ onBeforeUnmount(() => {
                     <div class="cleanup-copy">
                       <div>
                         <b>{{ item.name }}</b>
-                        <span class="risk-badge developer">可清理</span>
+                        <span class="risk-badge cleanable">可清理</span>
                       </div>
                       <p>{{ item.description }}</p>
                       <small :title="item.path">{{ item.path }}</small>
@@ -2369,7 +2427,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div v-if="cleanupTab === 'all' || cleanupTab === 'review'" v-show="reviewItems.length && (cleanupTab === 'review' || cleanupTab === 'all')" class="cleanup-group">
-                <div class="cleanup-group-title"><b>需人工复核</b><small>不提供一键删除，请打开确认</small></div>
+                <div class="cleanup-group-title"><b>需复核</b><small>不提供一键删除，请打开确认</small></div>
                 <div class="cleanup-rows">
                   <div v-for="item in reviewItems" :key="item.id" class="cleanup-row">
                     <span class="action-symbol review"><AlertTriangle :size="17" /></span>
@@ -2468,7 +2526,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="filter-group">
-              <span>年龄</span>
+              <span>修改时间</span>
               <div class="chip-row">
                 <button v-for="item in [{ id: 'all', label: '全部' }, { id: 'year', label: '≥90天' }, { id: 'old', label: '≥1年' }]" :key="item.id" type="button" class="chip-btn" :class="{ active: fileAgeFilter === item.id }" @click="fileAgeFilter = item.id as typeof fileAgeFilter">{{ item.label }}</button>
               </div>
@@ -2834,7 +2892,7 @@ onBeforeUnmount(() => {
           <p class="settings-footnote"><Info :size="15" /> 仅保存在本机浏览器存储，不会上传。完整操作审计可后续再加强。</p>
         </div>
 <div v-else class="settings-content about-content">
-          <div class="about-product"><span class="about-mark"><HardDrive :size="28" /></span><div><h3>磁盘空间分析器</h3><p>Windows 本地空间诊断、媒体管理与安全清理工具</p><b>版本 6.2.0</b></div></div>
+          <div class="about-product"><span class="about-mark"><HardDrive :size="28" /></span><div><h3>磁盘空间分析器</h3><p>Windows 本地空间诊断、媒体管理与安全清理工具</p><b>版本 {{ APP_VERSION }}</b></div></div>
           <section class="about-section"><h4>系统架构</h4><dl><div><dt>桌面框架</dt><dd>Tauri 2</dd></div><div><dt>用户界面</dt><dd>Vue 3 + TypeScript</dd></div><div><dt>扫描引擎</dt><dd>Rust</dd></div><div><dt>运行平台</dt><dd>Windows 10 / 11 · 64 位</dd></div></dl></section>
           <section class="about-section"><h4>作者信息</h4><dl><div><dt>项目作者 / GitHub</dt><dd>songmeng@hotmail.com</dd></div><div><dt>软件许可</dt><dd>MIT License</dd></div></dl></section>
           <section class="about-safety"><ShieldCheck :size="20" /><div><b>本地优先，删除可恢复</b><p>扫描、哈希、缩略图和历史快照均在本机处理。媒体与清理中心统一移入 Windows 回收站；开发缓存需邻居验证后才可勾选。</p></div></section>
@@ -3156,7 +3214,7 @@ onBeforeUnmount(() => {
 .activity-meta dd{margin:0;word-break:break-all}
 .workspace{position:relative}
 
-.pull-edge{position:absolute;left:0;right:0;top:0;height:22px;z-index:22;cursor:ns-resize}
+.pull-edge{position:absolute;left:0;right:0;top:0;height:22px;z-index:22;cursor:default}
 .status-scrim{position:fixed;inset:0;z-index:25;background:transparent}
 .status-scrim.dim{background:#10182833;backdrop-filter:blur(1px)}
 .status-shade{position:fixed;left:12px;top:0;transform:translateY(-105%);width:min(440px,calc(100vw - 24px));max-height:min(72vh,640px);z-index:30;background:#fff;border:1px solid #e4e7eb;border-top:0;border-radius:0 0 16px 16px;box-shadow:0 20px 50px #10182833;display:flex;flex-direction:column;overflow:hidden;transition:transform .22s ease}
@@ -3172,7 +3230,7 @@ onBeforeUnmount(() => {
 .shade-foot{padding:10px 14px;border-top:1px solid #edf0f2}
 .status-chip em{position:absolute;top:-4px;right:-4px;min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:#c94331;color:#fff;font-size:10px;font-style:normal;display:grid;place-items:center}
 
-.pull-edge{position:absolute;left:0;right:0;top:0;height:22px;z-index:22;cursor:ns-resize}
+.pull-edge{position:absolute;left:0;right:0;top:0;height:22px;z-index:22;cursor:default}
 .pull-bar{position:absolute;left:50%;top:8px;width:46px;height:4px;margin-left:-23px;border-radius:99px;background:#c5cad3;opacity:0;transform:translateY(-2px);transition:opacity .18s ease, transform .18s ease;pointer-events:none}
 .pull-bar.show{opacity:.95;transform:translateY(0)}
 
@@ -4618,5 +4676,102 @@ html[data-border-level="hard"] .duplicate-results.panel{
   border-top:1px solid #eef0f2!important;
   padding-top:10px!important;
   margin:0!important;
+}
+
+.risk-badge.cleanable{background:#e8fbf4;color:#0f8f6b;border:1px solid #bdebdc}
+
+.status-shade .shade-foot{
+  display:flex!important;
+  flex-wrap:wrap!important;
+  gap:8px!important;
+  align-items:center!important;
+  justify-content:flex-start!important;
+}
+.status-shade .shade-head-actions .text-button:disabled{
+  opacity:.4;cursor:not-allowed;
+}
+/* 上推时帘跟手更顺 */
+.status-shade.dragging{
+  transition:none!important;
+}
+
+.status-shade .shade-handle{
+  height:18px!important;
+  
+  flex:none!important;
+  touch-action:none;
+}
+
+
+
+.status-shade .shade-head-actions{cursor:default;user-select:auto}
+
+/* shade: android-like sheet, no grab cursor, soft motion */
+.pull-edge{
+  cursor:default!important;
+  touch-action:none;
+}
+.pull-bar{
+  transition:opacity .22s ease, transform .22s cubic-bezier(.22,.9,.3,1)!important;
+}
+.status-scrim{
+  transition:background .28s ease, backdrop-filter .28s ease, opacity .28s ease!important;
+}
+.status-scrim.dim{
+  background:#10182840!important;
+  backdrop-filter:blur(3px);
+}
+.status-shade{
+  will-change:transform,opacity;
+  transition:transform .32s cubic-bezier(.22,.9,.3,1), opacity .28s ease!important;
+}
+.status-shade.dragging{
+  transition:none!important;
+}
+.status-shade .shade-handle{
+  width:40px!important;
+  height:4px!important;
+  margin:10px auto 4px!important;
+  border-radius:99px!important;
+  background:#c5cad3!important;
+  cursor:default!important;
+  flex:none!important;
+  touch-action:none;
+  opacity:.9;
+}
+.status-shade .shade-head,
+.status-shade .shade-foot{
+  cursor:default!important;
+  touch-action:none;
+  user-select:none;
+}
+.status-shade .shade-head-actions,
+.status-shade .shade-head-actions *{
+  cursor:pointer!important;
+  user-select:auto;
+  touch-action:auto;
+}
+/* 底部上滑区：类似安卓通知栏底部空白 */
+.status-shade .shade-dismiss{
+  flex:1 1 auto;
+  min-height:48px;
+  touch-action:none;
+  cursor:default;
+}
+.status-shade .status-list{
+  flex:0 1 auto;
+  max-height:none!important;
+}
+.status-shade .status-list:empty,
+.status-shade .status-list:not(:has(*)){
+  display:none;
+}
+/* 通知空态：不显示虚线框文案 */
+.status-shade .status-list .no-matches{
+  display:none!important;
+}
+.status-shade .shade-foot{
+  margin-top:0!important;
+  border-top:1px solid color-mix(in srgb, var(--u1-border, #edf0f2) 80%, transparent)!important;
 }
 </style>

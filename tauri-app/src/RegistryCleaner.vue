@@ -90,6 +90,7 @@ const BASIC_CATEGORY_OPTIONS: Array<{ id: CategoryId; label: string }> = [
   { id: 'app-path', label: '无效的应用程序路径' },
   { id: 'uninstall', label: '无效的卸载程序' },
   { id: 'history', label: '无效的历史记录' },
+  // id 对应注册表 HKEY_CLASSES_ROOT 下 shell open 命令类扫描（后端 category: user-command）
   { id: 'user-command', label: '无效的文件类型' },
   { id: 'help', label: '无效的帮助文件' },
   { id: 'fonts', label: '无效的字体' },

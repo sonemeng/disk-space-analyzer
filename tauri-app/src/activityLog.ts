@@ -105,6 +105,13 @@ export function clearActivityLog() {
   notify()
 }
 
+/** 删除单条活动（通知中心查看后移除） */
+export function removeActivity(id: string) {
+  const next = loadActivityLog().filter(item => item.id !== id)
+  saveActivityLog(next)
+  return next
+}
+
 export function exportActivityLogText(entries: ActivityEntry[] = loadActivityLog()) {
   const lines = entries.flatMap(item => {
     const time = new Date(item.at).toLocaleString('zh-CN')
