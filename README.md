@@ -1,178 +1,126 @@
-# 磁盘空间分析器 💾
+# 磁盘空间分析器
 
-> 原生 Windows 桌面应用 —— 快速分析磁盘空间占用，交互式可视化，一键清理指导
+原生 Windows 桌面应用：分析磁盘占用、安全清理、媒体与注册表健康检查。
 
-![版本](https://img.shields.io/badge/版本-6.1.0-blue) ![Tauri](https://img.shields.io/badge/Tauri-2-green) ![平台](https://img.shields.io/badge/平台-Windows-blue)
+[English](README.en.md) | [日本語](README.ja.md) | [Русский](README.ru.md)
+
+[![Version](https://img.shields.io/badge/version-6.2.2-blue)](https://github.com/sonemeng/disk-space-analyzer/releases)
+[![Tauri](https://img.shields.io/badge/Tauri-2-green)](https://tauri.app/)
+[![Platform](https://img.shields.io/badge/platform-Windows-blue)](https://github.com/sonemeng/disk-space-analyzer)
 
 ---
 
-## 功能
+## 功能概览
 
-| 功能 | 说明 |
+| 模块 | 说明 |
 |------|------|
-| 🖥️ **原生 GUI** | tkinter 构建，真正的 Windows 窗口，无控制台，不依赖浏览器 |
-| 💿 **多盘分析** | 支持 C:/D:/E: 任意磁盘，一键切换 |
-| 📁 **点击跳转** | 双击目录行直接打开资源管理器定位到文件夹 |
-| 📊 **统计面板** | 磁盘使用率环形条、类别汇总（系统/缓存/用户文件等）、文件类型分布 |
-| 🐋 **大文件定位** | 自动扫描 >100MB 的大文件，助你批量清理 |
-| 📄 **HTML 导出** | 生成带可点击链接的可视化报告 |
-| 🧹 **清理建议** | 智能识别可清理项（Temp、旧备份、WinSxS 等） |
-| ⚡ **并行扫描** | 多线程加速，30-60 秒完成 C 盘完整分析 |
-| 🛡️ **安全清理** | 选盘 → 完整扫描后才出清理项；分组展示；预览释放量；统一回收站 |
-| 🧑‍💻 **开发缓存识别** | 邻居验证 + 高置信可勾选；`build/dist` 仅提示；支持清理黑名单 |
-| 💾 **按盘缓存** | 换盘保留该盘上次扫描与清理结果，重扫才刷新 |
-| 🖼️ **媒体管理** | 图片相似度、截图/模糊候选、音视频属性、重复媒体与回收站处理 |
-| 🧩 **注册表检查** | 与分区无关，仅 HKCU；失效启动项/App Paths 可备份修复 |
+| 空间概览 | 整盘扫描、容量与类别分布、空间归因与建议 |
+| 清理中心 | 分类 Tab：固定白名单 / 开发可重建 / 工具·AI / 应用缓存 / 需复核 / 系统 |
+| 文件审查 | 目录排行、大文件筛选、按类型浏览、多选回收站 |
+| 深度分析 | 重复文件、空间趋势 Diff、文件年龄、行动清单 |
+| 媒体管理 | 图片/视频/音频分析，重复与回收站处理 |
+| 注册表检查 | HKCU 健康检查，备份后修复；不碰 HKLM 服务驱动 |
 
-## 快速开始
+### 安全原则
 
-### Tauri 6.1 开发版
+- 删除一律进入 **Windows 回收站**（可还原），无永久删除 API
+- 开发缓存需 **邻居验证**（如 `package.json` 旁的 `node_modules`）
+- 模型 / 应用缓存等需 **强确认** 后才可清理
+- 扫描与哈希仅在本机处理，不上传路径内容
+
+---
+
+## 下载
+
+从 [Releases](https://github.com/sonemeng/disk-space-analyzer/releases) 下载最新版，例如：
+
+- `DiskSpaceAnalyzer-6.2.2.exe`（便携版，双击运行）
+
+适用于 Windows 10 / 11 64 位。
+
+---
+
+## 开发与构建
 
 ```bash
 cd tauri-app
-npm install --cache .npm-cache
-
-# 启动 Tauri 桌面开发窗口
-npm run tauri dev
-
-# 生成 Windows 安装包/可执行文件
-npm run tauri build
+npm install
+npm run tauri dev      # 开发窗口
+npm run tauri build    # 正式构建
 ```
 
-Tauri 版本使用 Rust 原生扫描器，支持实时进度、取消、目录和大文件排行、指定文件夹逐层分析、数据盘文件类型分布、重复文件检测、空间历史趋势、文件年龄热力图、整盘/文件夹媒体管理、注册表健康检查、资源管理器定位、HTML 报告导出及安全清理中心。
+仅前端打包进 exe（无安装器）：
 
-### 媒体管理中心
+```bash
+cd tauri-app
+npx tauri build --no-bundle
+# 产物: src-tauri/target/release/disk-analyzer.exe
+```
 
-- **图片**：SHA-256 完全重复、感知哈希相似组、截图识别、清晰度候选、尺寸与缩略图。
-- **视频**：格式、大小、重复与超大筛选；检测到 `ffprobe` 时增加时长、分辨率、编码和码率。
-- **音频**：时长、格式、码率、采样率、重复与无损格式占用。
-- **安全处理**：所有媒体操作统一移入 Windows 回收站，不提供永久删除。
-- **分析范围**：可从已检测盘符中选择整盘，也可选择任意文件夹；整盘分析支持实时进度和取消。
+生产前端必须使用 `vite base: './'`，否则 Tauri release 可能白屏。
 
-详细算法、限制和安全边界见 [媒体管理中心说明](docs/MEDIA_CENTER.md)。
+---
 
-### 注册表健康检查
+## 主要模块说明
 
-- **与侧栏磁盘分区无关**：检查的是当前 Windows 用户 `HKCU`，换 C/D/E 不会改变结果。
-- 检查目标已不存在的用户启动项与 App Paths（可备份后修复）。
-- 卸载信息残留仅建议人工复核，不自动删除。
-- 修复前强制 `reg export`；任一备份失败则整次中止。
-- **明确不碰**：HKLM、服务、驱动、COM、文件关联、共享 DLL；不需要管理员权限。
+### 清理中心
 
-详细范围、备份位置和恢复方法见 [注册表检查说明](docs/REGISTRY_CLEANER.md)。
+1. 选择磁盘并完成 **完整扫描**
+2. 按分类查看可清理项（本类全选不包含强确认项）
+3. 可选 **预览释放量**（dry-run）
+4. 确认后 **移入回收站**；热文件 / 占用文件会跳过
 
-### 个性化与关于
+详见路线图与规则草案：
 
-- **主题配色**：七套浅色主题，强调色和侧栏色同步切换。
-- **字体与图标**：分别提供小/标准/大三级视觉尺寸。
-- **界面密度**：紧凑模式适合信息密集浏览，舒适模式更易读。
-- **设置持久化**：全部偏好只保存在浏览器本地存储，不进入扫描快照。
-- **扫描设置**：排除目录、**清理黑名单**、大文件阈值、并发数和每盘快照上限。
-- **系统设置**：报告目录、回收站确认、更新检查、历史清除和诊断导出。
-- **关于系统**：展示版本、Vue 3 + Tauri 2 + Rust 架构、平台、许可和作者联系信息。
+- [docs/ROADMAP.md](docs/ROADMAP.md)
+- [docs/DEV_AI_CACHE_RULES_DRAFT.md](docs/DEV_AI_CACHE_RULES_DRAFT.md)
+- [docs/TOOL_AI_COVERAGE.md](docs/TOOL_AI_COVERAGE.md)
+
+### 媒体管理
+
+图片相似度、音视频属性、重复媒体；统一回收站。说明见 [docs/MEDIA_CENTER.md](docs/MEDIA_CENTER.md)。
+
+### 注册表检查
+
+仅当前用户 HKCU；修复前强制备份。说明见 [docs/REGISTRY_CLEANER.md](docs/REGISTRY_CLEANER.md)。
 
 ### 深度分析
 
-- **重复文件**：先按大小筛选候选，再用 SHA-256 校验内容。仅提供定位，不自动删除。
-- **空间趋势**：完整扫描后自动保存本地快照，展示已用空间和最大目录变化。
-- **文件年龄**：按最近修改时间统计空间，列出超过一年未修改的 TOP 大文件。
+重复文件（大小 + SHA-256）、空间快照趋势、文件年龄。说明见 [docs/ANALYSIS_FEATURES.md](docs/ANALYSIS_FEATURES.md)。
 
-快照保存在 `%LOCALAPPDATA%\DiskAnalyzer\snapshots.json`，每个盘可配置保留 10–100 条。所有哈希、路径、缩略图和统计都只在本机处理。
-
-### 清理中心流程
-
-1. **选盘** → 只读容量，不后台扫清理  
-2. **完整扫描** → 生成空间结果，并分析该盘可清理项  
-3. **分组勾选** → 固定白名单默认勾选；开发可重建需手动勾选  
-4. **预览释放量**（可选）→ dry-run，不删除  
-5. **移入回收站** → 非永久删除；热文件/占用文件自动跳过  
-
-**固定白名单**：临时文件、浏览器缓存、崩溃转储等（有最短闲置时间）。  
-**开发可重建（高置信才可勾选）**：`node_modules`、`target`、Python 缓存、`.next` 等，须 **邻居验证**；`build`/`dist`/`out` 仅提示。  
-**清理黑名单**：设置中添加的路径永不进清理列表。
-
-详细算法和安全边界见 [深度分析说明](docs/ANALYSIS_FEATURES.md)。
-
-### 下载即用
-
-从 [Releases](https://github.com/sonemeng/disk-space-analyzer/releases) 下载最新版 `磁盘空间分析器.exe`，双击运行。
-
-`dist\磁盘空间分析器.exe` 是免安装便携版：发送给其他 Windows 10/11 64 位用户后可直接双击运行，不会出现安装位置选择。正式安装包需要执行完整的 `npm run tauri build`，生成 MSI 或 NSIS 安装器后才能提供安装路径、开始菜单和卸载入口。
-
-### 从源码构建
-
-```bash
-# 1. 克隆或复制项目到本地
-cd 磁盘空间分析器
-
-# 2. 安装依赖
-pip install -r requirements-dev.txt
-
-# 3. 运行开发版
-python src\__main__.py
-
-# 4. 打包成单文件 .exe
-scripts\build.bat
-# 输出在 dist\ 目录
-```
-
-## 使用说明
-
-1. **启动** — 双击 `磁盘空间分析器.exe`
-2. **选盘** — 顶部下拉框选择要扫描的磁盘
-3. **开始** — 点击 ▶ 开始扫描，进度条实时显示
-4. **浏览** — 扫描完成后目录按占用从大到小排列
-5. **跳转** — 双击任意目录行 → 自动打开资源管理器
-6. **导出** — 点击「导出 HTML」生成带链接的网页报告
-
-### 目录颜色规则
-
-- 🔴 **红色** — 占用磁盘 >10%，重点关注
-- 🟡 **黄色** — 占用 5%~10%，值得关注
-- 🔵 **蓝色/绿色** — 占用 <5%，常规项
+---
 
 ## 项目结构
 
 ```
 磁盘空间分析器/
-├── src/                    # 源码
-│   ├── __main__.py         # 入口
-│   ├── app.py              # tkinter GUI 主窗口
-│   ├── scanner.py          # 扫描引擎（多线程）
-│   ├── html_report.py      # HTML 报告生成
-│   └── utils.py            # 工具函数
-├── assets/                 # 资源文件
-│   ├── icon-5.1.png        # 5.1 高分辨率图标源文件
-│   └── icon.ico            # Windows 多尺寸应用图标
-├── scripts/                # 脚本工具
-│   └── build.bat           # 一键打包
-├── tests/                  # 测试
-│   └── test_scanner.py
-├── dist/                   # 构建产物（.exe）
-├── docs/                   # 文档
+├── tauri-app/                 # 主产品（Vue 3 + Tauri 2 + Rust）
+│   ├── src/                   # 前端
+│   └── src-tauri/src/         # 扫描 / 清理 / 媒体 / 注册表 / 规则包
+├── docs/                      # 文档
+├── dist/                      # 本地便携 exe（不保证纳入 git）
+├── src/                       # 历史 Python 版（可选）
 ├── README.md
 ├── CHANGELOG.md
-├── DEVELOPMENT.md
-├── pyproject.toml
-├── requirements-dev.txt
 └── LICENSE
 ```
 
+---
+
 ## 技术栈
 
-### Tauri 桌面版
+- 界面：Vue 3 + TypeScript + Lucide
+- 桌面：Tauri 2
+- 引擎：Rust
+- 平台：Windows 10 / 11 x64
 
-- **界面:** Vue 3 + TypeScript + Lucide
-- **桌面框架:** Tauri 2
-- **扫描引擎:** Rust
-- **运行时:** Windows 10 / 11 64 位
+---
 
-### Python 经典版
+## 更新日志
 
-- **语言:** Python 3.11+
-- **GUI:** tkinter (标准库)
-- **打包:** PyInstaller 6.x
-- **运行时:** 无外部依赖（纯标准库运行）
+见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
 
 ## 许可
 
