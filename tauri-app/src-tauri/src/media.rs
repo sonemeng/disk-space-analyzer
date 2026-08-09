@@ -115,7 +115,7 @@ pub struct MediaScanResult {
     pub truncated: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RecycleResult {
     pub recycled_files: u64,
@@ -805,37 +805,6 @@ pub fn run_media_scan(
         skipped_items,
         ffprobe_available,
         truncated,
-    })
-}
-
-pub fn recycle_media_files(paths: Vec<String>) -> Result<RecycleResult, String> {
-    if paths.is_empty() || paths.len() > 1_000 {
-        return Err("请选择 1 到 1000 个媒体文件".into());
-    }
-    let mut recycled_files = 0_u64;
-    let mut recycled_bytes = 0_u64;
-    let mut failed_items = 0_u64;
-    for value in paths {
-        let path = PathBuf::from(value);
-        if !path.is_absolute() || !path.is_file() || media_kind(&path).is_none() {
-            failed_items += 1;
-            continue;
-        }
-        let size = fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        match trash::delete(&path) {
-            Ok(()) => {
-                recycled_files += 1;
-                recycled_bytes = recycled_bytes.saturating_add(size);
-            }
-            Err(_) => failed_items += 1,
-        }
-    }
-    Ok(RecycleResult {
-        recycled_files,
-        recycled_bytes,
-        failed_items,
     })
 }
 

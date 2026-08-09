@@ -3,6 +3,7 @@
 mod app_cache_rules;
 mod dev_rules;
 mod media;
+mod recycle;
 mod registry;
 mod tool_ai_rules;
 
@@ -15,9 +16,9 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const LARGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 const DEV_SCAN_MAX_DEPTH: usize = 8;
@@ -473,11 +474,11 @@ fn build_categories(items: &[DirectoryItem]) -> Vec<CategoryItem> {
     categories
 }
 
-fn build_file_types(values: HashMap<&'static str, u64>) -> Vec<CategoryItem> {
+fn build_file_types(values: HashMap<String, u64>) -> Vec<CategoryItem> {
     let mut items = values
         .into_iter()
         .map(|(name, size)| {
-            let color = match name {
+            let color = match name.as_str() {
                 "图片" => "#22c55e",
                 "视频" => "#8b5cf6",
                 "音频" => "#f97316",
@@ -498,7 +499,7 @@ fn build_file_types(values: HashMap<&'static str, u64>) -> Vec<CategoryItem> {
     items
 }
 
-fn build_age_buckets(values: HashMap<&'static str, (u64, u64)>) -> Vec<AgeBucket> {
+fn build_age_buckets(values: HashMap<String, (u64, u64)>) -> Vec<AgeBucket> {
     [
         ("recent", "最近 30 天", "#22c55e"),
         ("quarter", "30–90 天", "#3b82f6"),
@@ -525,12 +526,22 @@ fn run_scan(
     drive: String,
     options: ScanOptions,
     cancel: Arc<AtomicBool>,
+    resume: Option<ResumeState>,
 ) -> Result<ScanResult, String> {
     let started = Instant::now();
     let large_file_bytes = options.large_file_bytes.clamp(1024 * 1024, 1024_u64.pow(4));
     let usage = disk_usage(&drive)?;
     let root = PathBuf::from(format!("{}\\", drive));
     emit_progress(&app, "正在读取根目录", 3, Some(&root));
+
+    if let Some(state) = &resume {
+        emit_progress(
+            &app,
+            format!("断点续扫：已跳过 {} 个目录", state.completed_roots.len()),
+            5,
+            None,
+        );
+    }
 
     let mut roots = Vec::new();
     let mut root_files = Vec::new();
@@ -553,13 +564,44 @@ fn run_scan(
     }
     roots.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
 
-    let mut directories = Vec::new();
-    let mut large_files = Vec::new();
-    let mut scanned_files = 0;
-    let mut scanned_dirs = 0;
-    let mut skipped_items = 0;
-    let mut file_type_sizes = HashMap::new();
-    let mut age_sizes = HashMap::new();
+let mut directories = resume
+        .as_ref()
+        .map(|state| state.completed_roots.clone())
+        .unwrap_or_default();
+    let mut large_files = resume
+        .as_ref()
+        .map(|state| state.large_files.clone())
+        .unwrap_or_default();
+    let mut scanned_files = resume
+        .as_ref()
+        .map(|state| state.completed_files)
+        .unwrap_or(0);
+    let mut scanned_dirs = resume
+        .as_ref()
+        .map(|state| state.completed_dirs)
+        .unwrap_or(0);
+    let mut skipped_items = resume
+        .as_ref()
+        .map(|state| state.completed_skipped)
+        .unwrap_or(0);
+    let mut file_type_sizes = resume
+        .as_ref()
+        .map(|state| state.file_type_sizes.clone())
+        .unwrap_or_default();
+    let mut age_sizes = resume
+        .as_ref()
+        .map(|state| state.age_sizes.clone())
+        .unwrap_or_default();
+    let done_paths: std::collections::HashSet<String> = resume
+        .as_ref()
+        .map(|state| {
+            state
+                .completed_roots
+                .iter()
+                .map(|item| item.path.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
     let total_roots = roots.len().max(1);
 
     let mut root_size = 0_u64;
@@ -570,11 +612,11 @@ fn run_scan(
                 let modified_days = metadata_age_days(&metadata);
                 root_size = root_size.saturating_add(size);
                 scanned_files += 1;
-                let (group, _) = file_type_group(&path);
-                let total = file_type_sizes.entry(group).or_insert(0_u64);
+let (group, _) = file_type_group(&path);
+                let total = file_type_sizes.entry(group.to_string()).or_insert(0_u64);
                 *total = total.saturating_add(size);
                 let bucket = age_sizes
-                    .entry(age_bucket(modified_days))
+                    .entry(age_bucket(modified_days).to_string())
                     .or_insert((0_u64, 0_u64));
                 bucket.0 = bucket.0.saturating_add(size);
                 bucket.1 += 1;
@@ -603,9 +645,12 @@ fn run_scan(
         });
     }
 
-    for (index, path) in roots.iter().enumerate() {
+for (index, path) in roots.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return Err("扫描已取消".into());
+            return Err("扫描已取消 (进度已保存，可下次继续扫描)".into());
+        }
+        if done_paths.contains(&path.to_string_lossy().to_ascii_lowercase()) {
+            continue;
         }
         let percentage = 5 + ((index * 83 / total_roots) as u8);
         let name = path
@@ -627,11 +672,11 @@ fn run_scan(
         scanned_dirs += aggregate.dirs;
         skipped_items += aggregate.skipped;
         for (name, size) in &aggregate.file_types {
-            let total = file_type_sizes.entry(*name).or_insert(0_u64);
+            let total = file_type_sizes.entry(name.to_string()).or_insert(0_u64);
             *total = total.saturating_add(*size);
         }
         for (id, (size, count)) in &aggregate.age_buckets {
-            let bucket = age_sizes.entry(*id).or_insert((0_u64, 0_u64));
+            let bucket = age_sizes.entry(id.to_string()).or_insert((0_u64, 0_u64));
             bucket.0 = bucket.0.saturating_add(*size);
             bucket.1 += *count;
         }
@@ -642,6 +687,22 @@ fn run_scan(
             size: aggregate.size,
             file_count: aggregate.files,
             dir_count: aggregate.dirs,
+        });
+        // 断点：每完成一个根目录即持久化进度
+        write_resume(&ResumeState {
+            drive: drive.clone(),
+            started_at: String::new(),
+            completed_roots: directories.clone(),
+            completed_files: scanned_files,
+            completed_dirs: scanned_dirs,
+            completed_skipped: skipped_items,
+            all_roots: roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            file_type_sizes: file_type_sizes.clone(),
+            age_sizes: age_sizes.clone(),
+            large_files: large_files.clone(),
         });
     }
 
@@ -654,7 +715,8 @@ fn run_scan(
     let categories = build_categories(&directories);
     let file_types = build_file_types(file_type_sizes);
     let age_buckets = build_age_buckets(age_sizes);
-    emit_progress(&app, "扫描完成", 100, None);
+emit_progress(&app, "扫描完成", 100, None);
+    clear_resume(&drive);
 
     Ok(ScanResult {
         drive,
@@ -671,14 +733,79 @@ fn run_scan(
     })
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeState {
+    drive: String,
+    started_at: String,
+    completed_roots: Vec<DirectoryItem>,
+    completed_files: u64,
+    completed_dirs: u64,
+    completed_skipped: u64,
+    all_roots: Vec<String>,
+    file_type_sizes: HashMap<String, u64>,
+    age_sizes: HashMap<String, (u64, u64)>,
+    large_files: Vec<LargeFile>,
+}
+
+/// 应用数据根目录（app_data_dir），setup 时初始化
+static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+fn resume_file_path(drive: &str) -> PathBuf {
+    DATA_ROOT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("scan-resume")
+        .join(format!(
+            "{}.json",
+            drive.trim_end_matches(':').to_ascii_lowercase()
+        ))
+}
+
+fn read_resume(drive: &str) -> Option<ResumeState> {
+    let path = resume_file_path(drive);
+    fs::read_to_string(path).ok().and_then(|c| serde_json::from_str(&c).ok())
+}
+
+fn write_resume(state: &ResumeState) {
+    let path = resume_file_path(&state.drive);
+    let _ = fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")));
+    if let Ok(content) = serde_json::to_string(state) {
+        let _ = fs::write(path, content);
+    }
+}
+
+fn clear_resume(drive: &str) {
+    let _ = fs::remove_file(resume_file_path(drive));
+}
+
+#[tauri::command]
+fn has_pending_scan() -> Result<Option<ResumeState>, String> {
+    for drive_letter in (b'A'..=b'Z').map(|b| (b as char).to_string()) {
+        if let Some(state) = read_resume(&drive_letter) {
+            return Ok(Some(state));
+        }
+    }
+    Ok(None)
+}
+
 #[tauri::command]
 async fn start_scan(
     app: AppHandle,
     state: State<'_, AppState>,
     drive: String,
     options: ScanOptions,
+    resume: Option<bool>,
 ) -> Result<ScanResult, String> {
     let drive = normalize_drive(&drive)?;
+    let resume_state = match resume.unwrap_or(false) {
+        true => read_resume(&drive),
+        false => {
+            clear_resume(&drive);
+            None
+        }
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut active = state.active_scan.lock().map_err(|_| "扫描状态不可用")?;
@@ -686,10 +813,11 @@ async fn start_scan(
             previous.store(true, Ordering::Relaxed);
         }
     }
-    let result =
-        tauri::async_runtime::spawn_blocking(move || run_scan(app, drive, options, cancel))
-            .await
-            .map_err(|e| format!("扫描任务异常: {e}"))?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_scan(app, drive, options, cancel, resume_state)
+    })
+    .await
+    .map_err(|e| format!("扫描任务异常: {e}"))?;
     if let Ok(mut active) = state.active_scan.lock() {
         *active = None;
     }
@@ -1047,44 +1175,75 @@ async fn scan_media(
 
 #[tauri::command]
 async fn recycle_media(paths: Vec<String>) -> Result<RecycleResult, String> {
-    tauri::async_runtime::spawn_blocking(move || media::recycle_media_files(paths))
-        .await
-        .map_err(|error| format!("回收站任务异常: {error}"))?
-}
-
-/// 通用文件移入回收站（文件审查 / 重复文件等）；仅普通文件，非目录
-#[tauri::command]
-async fn recycle_paths(paths: Vec<String>) -> Result<RecycleResult, String> {
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     tauri::async_runtime::spawn_blocking(move || {
-        if paths.is_empty() || paths.len() > 1_000 {
-            return Err("请选择 1 到 1000 个文件".into());
+        if pathbufs.is_empty() || pathbufs.len() > 1_000 {
+            return Err("请选择 1 到 1000 个媒体文件".into());
         }
-        let mut recycled_files = 0_u64;
-        let mut recycled_bytes = 0_u64;
-        let mut failed_items = 0_u64;
-        for value in paths {
-            let path = PathBuf::from(&value);
-            if !path.is_absolute() || !path.is_file() {
-                failed_items += 1;
-                continue;
-            }
-            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            match trash::delete(&path) {
-                Ok(()) => {
-                    recycled_files += 1;
-                    recycled_bytes = recycled_bytes.saturating_add(size);
-                }
-                Err(_) => failed_items += 1,
-            }
-        }
-        Ok(RecycleResult {
-            recycled_files,
-            recycled_bytes,
-            failed_items,
-        })
+        recycle::recycle_to_bin(pathbufs, "媒体中心", "媒体文件")
     })
     .await
-    .map_err(|e| format!("回收站任务异常: {e}"))?
+    .map_err(|error| format!("回收站任务异常: {error}"))?
+}
+
+/// 通用文件移入应用回收桶（文件审查 / 重复文件等）
+#[tauri::command]
+async fn recycle_paths(
+    paths: Vec<String>,
+    source: Option<String>,
+    label: Option<String>,
+) -> Result<RecycleResult, String> {
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let source = source.unwrap_or_else(|| "文件审查".into());
+    let label = label.unwrap_or_else(|| "文件回收".into());
+    tauri::async_runtime::spawn_blocking(move || recycle::recycle_to_bin(pathbufs, &source, &label))
+        .await
+        .map_err(|e| format!("回收站任务异常: {e}"))?
+}
+
+#[tauri::command]
+async fn list_recycle_items() -> Result<recycle::RecycleSummary, String> {
+    tauri::async_runtime::spawn_blocking(recycle::list_entries)
+        .await
+        .map_err(|e| format!("读取回收桶异常: {e}"))?
+}
+
+#[tauri::command]
+async fn restore_recycle_item(id: String) -> Result<recycle::RestoreResult, String> {
+    let id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || recycle::restore_entry(&id))
+        .await
+        .map_err(|e| format!("还原任务异常: {e}"))?
+}
+
+#[tauri::command]
+async fn purge_recycle_item(id: String) -> Result<(), String> {
+    let id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || recycle::purge_entry(&id))
+        .await
+        .map_err(|e| format!("删除回收条目异常: {e}"))?
+}
+
+#[tauri::command]
+async fn empty_recycle_bin() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(recycle::empty_bin)
+        .await
+        .map_err(|e| format!("清空回收桶异常: {e}"))?
+}
+
+#[tauri::command]
+async fn list_cleanup_snapshots() -> Result<Vec<recycle::CleanupSnapshot>, String> {
+    tauri::async_runtime::spawn_blocking(recycle::list_cleanup_snapshots)
+        .await
+        .map_err(|e| format!("读取清理快照异常: {e}"))?
+}
+
+#[tauri::command]
+async fn delete_cleanup_snapshot(id: String) -> Result<(), String> {
+    let id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || recycle::delete_cleanup_snapshot(&id))
+        .await
+        .map_err(|e| format!("删除清理快照异常: {e}"))?
 }
 
 #[tauri::command]
@@ -1904,11 +2063,39 @@ async fn analyze_cleanup(
     .map_err(|e| format!("清理分析任务异常: {e}"))?
 }
 
-fn trash_path(path: &Path) -> Result<(), String> {
-    trash::delete(path).map_err(|e| format!("移入回收站失败 {}: {e}", path.display()))
+fn trash_path(path: &Path, queued: &mut Vec<PathBuf>) {
+    queued.push(path.to_path_buf());
 }
 
-fn clean_definition(definition: &CleanupDefinition, dry_run: bool) -> CleanupResult {
+fn size_of(path: &Path) -> u64 {
+    let metadata = fs::metadata(path);
+    match metadata {
+        Ok(m) if m.is_file() => m.len(),
+        Ok(_) => walkdir::WalkDir::new(path)
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .fold(0_u64, |acc, m| acc.saturating_add(m.len())),
+        Err(_) => 0,
+    }
+}
+
+fn flush_recycle(queued: &mut Vec<PathBuf>, source: &str, label: &str) -> Result<(), String> {
+    if queued.is_empty() {
+        return Ok(());
+    }
+    let paths = std::mem::take(queued);
+    recycle::recycle_to_bin(paths, source, label)?;
+    Ok(())
+}
+
+fn clean_definition(
+    definition: &CleanupDefinition,
+    dry_run: bool,
+    queued: &mut Vec<PathBuf>,
+) -> CleanupResult {
     let mut result = CleanupResult {
         freed_bytes: 0,
         deleted_files: 0,
@@ -1959,14 +2146,11 @@ fn clean_definition(definition: &CleanupDefinition, dry_run: bool) -> CleanupRes
                 result.deleted_files = result.deleted_files.saturating_add(files.max(1));
                 continue;
             }
-            match trash_path(root) {
-                Ok(()) => {
-                    result.freed_bytes = result.freed_bytes.saturating_add(size);
-                    result.deleted_files = result.deleted_files.saturating_add(files.max(1));
-                }
-                Err(_) => result.failed_items += 1,
-            }
+trash_path(root, queued);
+            result.freed_bytes = result.freed_bytes.saturating_add(size);
+            result.deleted_files = result.deleted_files.saturating_add(files.max(1));
         }
+        let _ = flush_recycle(queued, "清理中心", &definition.name);
         return result;
     }
 
@@ -2005,15 +2189,12 @@ fn clean_definition(definition: &CleanupDefinition, dry_run: bool) -> CleanupRes
                 result.deleted_files += 1;
                 continue;
             }
-            match trash_path(entry.path()) {
-                Ok(()) => {
-                    result.freed_bytes = result.freed_bytes.saturating_add(metadata.len());
-                    result.deleted_files += 1;
-                }
-                Err(_) => result.failed_items += 1,
-            }
+trash_path(entry.path(), queued);
+                result.freed_bytes = result.freed_bytes.saturating_add(metadata.len());
+                result.deleted_files += 1;
         }
     }
+    let _ = flush_recycle(queued, "清理中心", &definition.name);
     result
 }
 
@@ -2023,6 +2204,7 @@ fn clean_app_path(
     drive: &str,
     blacklist: &[String],
     dry_run: bool,
+    queued: &mut Vec<PathBuf>,
 ) -> CleanupResult {
     let mut result = CleanupResult {
         freed_bytes: 0,
@@ -2058,13 +2240,10 @@ fn clean_app_path(
         result.deleted_files = files.max(1);
         return result;
     }
-    match trash_path(path) {
-        Ok(()) => {
-            result.freed_bytes = size;
-            result.deleted_files = files.max(1);
-        }
-        Err(_) => result.failed_items = 1,
-    }
+    trash_path(path, queued);
+    result.freed_bytes = size;
+    result.deleted_files = files.max(1);
+    let _ = flush_recycle(queued, "清理中心", rule_id);
     result
 }
 
@@ -2075,6 +2254,7 @@ fn clean_toolai_path(
     protect_prefixes: &[String],
     blacklist: &[String],
     dry_run: bool,
+    queued: &mut Vec<PathBuf>,
 ) -> CleanupResult {
     let mut result = CleanupResult {
         freed_bytes: 0,
@@ -2115,13 +2295,10 @@ fn clean_toolai_path(
         result.deleted_files = files.max(1);
         return result;
     }
-    match trash_path(path) {
-        Ok(()) => {
-            result.freed_bytes = size;
-            result.deleted_files = files.max(1);
-        }
-        Err(_) => result.failed_items = 1,
-    }
+    trash_path(path, queued);
+    result.freed_bytes = size;
+    result.deleted_files = files.max(1);
+    let _ = flush_recycle(queued, "清理中心", rule_id);
     result
 }
 
@@ -2209,6 +2386,49 @@ async fn clean_items(
             dry_run,
             skipped_hot: 0,
         };
+        // 清理前：收集本次将删除的文件信息，生成可对照的快照（复习还原）
+        let mut snapshot_entries: Vec<recycle::SnapshotEntry> = Vec::new();
+        for id in &requested {
+            let mut paths: Vec<(PathBuf, u64)> = Vec::new();
+            let mut label = id.clone();
+            if id.starts_with("toolai:") {
+                if let Some((rule_id, path)) = tool_ai_rules::parse_toolai_id(id) {
+                    label = rule_id.clone();
+                    let p = path.clone();
+                    paths.push((path, size_of(&p)));
+                }
+            } else if id.starts_with("app:") {
+                if let Some((rule_id, path)) = app_cache_rules::parse_app_id(id) {
+                    label = rule_id.clone();
+                    let p = path.clone();
+                    paths.push((path, size_of(&p)));
+                }
+            } else if let Some(definition) = definitions.iter().find(|d| d.id == *id) {
+                label = definition.name.clone();
+                paths = definition
+                    .paths
+                    .iter()
+                    .map(|p| (p.clone(), size_of(p)))
+                    .collect();
+            }
+            if !dry_run && !paths.is_empty() {
+                snapshot_entries.push(recycle::SnapshotEntry {
+                    source: "清理中心".into(),
+                    label,
+                    paths: paths
+                        .into_iter()
+                        .map(|(path, size)| recycle::SnapshotPath {
+                            path: path.to_string_lossy().into_owned(),
+                            size,
+                            modified_days: fs::metadata(&path)
+                                .ok()
+                                .and_then(|m| metadata_age_days(&m)),
+                        })
+                        .collect(),
+                });
+            }
+        }
+        let mut queued: Vec<PathBuf> = Vec::new();
         for id in &requested {
             if id.starts_with("toolai:") {
                 if let Some((rule_id, path)) = tool_ai_rules::parse_toolai_id(id) {
@@ -2219,6 +2439,7 @@ async fn clean_items(
                         &protect_prefixes,
                         &blacklist,
                         dry_run,
+                        &mut queued,
                     );
                     total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
                     total.deleted_files += result.deleted_files;
@@ -2231,8 +2452,14 @@ async fn clean_items(
             }
             if id.starts_with("app:") {
                 if let Some((rule_id, path)) = app_cache_rules::parse_app_id(id) {
-                    let result =
-                        clean_app_path(&rule_id, &path, &drive, &blacklist, dry_run);
+                    let result = clean_app_path(
+                        &rule_id,
+                        &path,
+                        &drive,
+                        &blacklist,
+                        dry_run,
+                        &mut queued,
+                    );
                     total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
                     total.deleted_files += result.deleted_files;
                     total.failed_items += result.failed_items;
@@ -2243,11 +2470,18 @@ async fn clean_items(
                 continue;
             }
             if let Some(definition) = definitions.iter().find(|d| d.id == *id) {
-                let result = clean_definition(definition, dry_run);
+                let result = clean_definition(definition, dry_run, &mut queued);
                 total.freed_bytes = total.freed_bytes.saturating_add(result.freed_bytes);
                 total.deleted_files += result.deleted_files;
                 total.failed_items += result.failed_items;
                 total.skipped_hot += result.skipped_hot;
+            }
+        }
+        if !dry_run && !snapshot_entries.is_empty() {
+            if let Ok(_snap_id) =
+                recycle::save_cleanup_snapshot(&drive, snapshot_entries.clone())
+            {
+                eprintln!("[cleanup] 已保存清理快照 {_snap_id}");
             }
         }
         Ok(total)
@@ -2513,16 +2747,29 @@ async fn check_for_updates(repository: String) -> Result<UpdateStatus, String> {
 }
 
 fn main() {
-    tauri::Builder::default()
+tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            let _ = DATA_ROOT.set(data_dir.clone());
+            recycle::init(data_dir.join("recycle-bin"))?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            start_scan,
+start_scan,
+            has_pending_scan,
             analyze_folder,
             find_duplicates,
             scan_media,
             recycle_media,
             recycle_paths,
+            list_recycle_items,
+            restore_recycle_item,
+            purge_recycle_item,
+            empty_recycle_bin,
+            list_cleanup_snapshots,
+            delete_cleanup_snapshot,
             analyze_registry,
             repair_registry,
             list_registry_backups,
