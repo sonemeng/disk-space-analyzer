@@ -3758,12 +3758,12 @@ html[data-border-level="hard"] .duplicate-results.panel{
 
 /* quick settings: full-width adaptive layout */
 .status-shade .quick-layout{
-  flex:1;
+  flex:0 0 auto;
   min-height:0;
-  overflow:auto;
+  overflow:visible;
   padding:12px 18px 24px;
   display:grid;
-  grid-template-columns:repeat(2,minmax(0,1fr));
+  grid-template-columns:repeat(3,minmax(0,1fr));
   gap:14px;
   align-content:start;
 }
