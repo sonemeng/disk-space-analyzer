@@ -3685,7 +3685,7 @@ nav.settings-tabs button.active,
   right:0!important;
   width:auto!important;
   max-width:none!important;
-  max-height:92vh!important;
+  max-height:100vh!important;
   border-radius:0 0 18px 0!important;
   border-left:1px solid var(--u1-border)!important;
   border-right:0!important;
@@ -3763,7 +3763,7 @@ html[data-border-level="hard"] .duplicate-results.panel{
   overflow:auto;
   padding:12px 18px 24px;
   display:grid;
-  grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns:repeat(2,minmax(0,1fr));
   gap:14px;
   align-content:start;
 }
