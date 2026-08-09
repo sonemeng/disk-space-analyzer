@@ -1,6 +1,6 @@
 [package]
 name = "disk-analyzer"
-version = "6.2.2"
+version = "6.2.3"
 description = "Modern disk space analyzer with Vue 3 UI"
 authors = ["songmeng <songmeng@hotmail.com>"]
 license = "MIT"

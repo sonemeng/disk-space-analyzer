@@ -183,7 +183,7 @@ interface AdvancedSettings {
   autoCheckUpdates: boolean
 }
 
-const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '6.2.2'
+const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '6.2.3'
 const isTauri = '__TAURI_INTERNALS__' in window
 type ThemeId = 'ocean' | 'forest' | 'coral' | 'cherry' | 'graphite' | 'mintrose' | 'lavenderteal'
 type FontScale = 'small' | 'standard' | 'large'
