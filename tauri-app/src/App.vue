@@ -3763,7 +3763,7 @@ html[data-border-level="hard"] .duplicate-results.panel{
   overflow:auto;
   padding:12px 18px 24px;
   display:grid;
-  grid-template-columns:repeat(3,minmax(0,1fr));
+  grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
   gap:14px;
   align-content:start;
 }
