@@ -28,6 +28,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["../../assets/icon.ico"]
+    "icon": ["../../assets/icon.ico"],
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
   }
 }
