@@ -1,24 +1,23 @@
-//! 应用内回收桶：删除 = 移入本地回收桶目录并记录原路径，
-//! 支持一键还原到原位置（冲突时生成 " (还原)" 后缀，绝不覆盖）。
-use crate::media::RecycleResult;
+//! 清理记录 + 系统回收站工具。
+//! 删除文件仍走 Windows 系统回收站（不额外占空间、资源管理器可见、卸载无残留），
+//! 应用内只记录"每次清理删了什么"（来源/标签/大小/路径清单），
+//! 并提供打开/清空系统回收站的入口。
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 回收桶根目录（app_data_dir/recycle-bin），由 main.rs setup 时初始化
+/// 应用数据根目录（app_data_dir/recycle-bin），由 main.rs setup 时初始化
 static BIN_ROOT: OnceLock<PathBuf> = OnceLock::new();
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredItem {
-    /// 原路径（还原目标）
+    /// 原路径
     pub original: String,
-    /// 桶内相对路径（相对回收桶根目录）
-    pub bin: String,
+    /// 文件大小（记录用）
+    pub size: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,22 +39,15 @@ pub struct RecycleSummary {
     pub total_bytes: u64,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RestoreResult {
-    pub restored: Vec<String>,
-    pub failed: Vec<String>,
-}
-
 pub fn init(root: PathBuf) -> Result<(), String> {
     if BIN_ROOT.set(root.clone()).is_err() {
         return Ok(()); // 已初始化
     }
-    fs::create_dir_all(&root).map_err(|e| format!("无法创建回收桶目录: {e}"))
+    fs::create_dir_all(&root).map_err(|e| format!("无法创建回收站记录目录: {e}"))
 }
 
 fn bin_dir() -> Result<&'static PathBuf, String> {
-    BIN_ROOT.get().ok_or_else(|| "回收桶未初始化".into())
+    BIN_ROOT.get().ok_or_else(|| "回收站记录未初始化".into())
 }
 
 fn entries_path() -> Result<PathBuf, String> {
@@ -74,68 +66,18 @@ fn read_entries() -> Result<Vec<RecycleEntry>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取回收记录失败: {e}"))?;
+    let content = fs::read_to_string(&path).map_err(|e| format!("读取清理记录失败: {e}"))?;
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_str(&content).map_err(|e| format!("解析回收记录失败: {e}"))
+    serde_json::from_str(&content).map_err(|e| format!("解析清理记录失败: {e}"))
 }
 
 fn write_entries(entries: &[RecycleEntry]) -> Result<(), String> {
     let path = entries_path()?;
     let content =
-        serde_json::to_string_pretty(entries).map_err(|e| format!("序列化回收记录失败: {e}"))?;
-    fs::write(path, content).map_err(|e| format!("保存回收记录失败: {e}"))
-}
-
-fn path_safe(path: &Path) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err("路径必须是绝对路径".into());
-    }
-    if path.starts_with(bin_dir()?) {
-        return Err("不允许操作回收桶内部路径".into());
-    }
-    Ok(())
-}
-
-/// 递归复制（跨卷移动的退路）；仅累加字节数，文件数由 move_entry 统一结算
-fn copy_recursive(source: &Path, dest: &Path, result: &mut RecycleResult) -> Result<(), String> {
-    let metadata = fs::metadata(source).map_err(|e| format!("读取元数据失败: {e}"))?;
-    if metadata.is_file() {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        fs::copy(source, dest).map_err(|e| format!("复制失败: {e}"))?;
-        fs::remove_file(source).map_err(|e| format!("删除源文件失败: {e}"))?;
-        result.recycled_bytes = result.recycled_bytes.saturating_add(metadata.len());
-        Ok(())
-    } else if metadata.is_dir() {
-        fs::create_dir_all(dest).map_err(|e| format!("创建目录失败: {e}"))?;
-        for entry in fs::read_dir(source).map_err(|e| format!("读取目录失败: {e}"))? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            copy_recursive(&entry.path(), &dest.join(entry.file_name()), result)?;
-        }
-        fs::remove_dir(source).ok();
-        Ok(())
-    } else {
-        Err("不支持的路径类型".into())
-    }
-}
-
-/// 移动（同卷 rename，跨卷复制+删除）；成功后累计 files/bytes
-fn move_entry(
-    source: &Path,
-    dest: &Path,
-    result: &mut RecycleResult,
-) -> Result<(), String> {
-    fs::rename(source, dest).or_else(|_| copy_recursive(source, dest, result))?;
-    if let Ok(metadata) = fs::metadata(dest) {
-        result.recycled_files += 1;
-        result.recycled_bytes = result
-            .recycled_bytes
-            .saturating_add(if metadata.is_file() { metadata.len() } else { size_of_path(dest) });
-    }
-    Ok(())
+        serde_json::to_string_pretty(entries).map_err(|e| format!("序列化清理记录失败: {e}"))?;
+    fs::write(path, content).map_err(|e| format!("保存清理记录失败: {e}"))
 }
 
 fn size_of_path(path: &Path) -> u64 {
@@ -153,76 +95,34 @@ fn size_of_path(path: &Path) -> u64 {
     }
 }
 
-fn count_files(path: &Path) -> u64 {
-    if path.is_file() {
-        return 1;
-    }
-    walkdir::WalkDir::new(path)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-        .filter(|e| e.file_type().is_file())
-        .count() as u64
-}
-
-pub fn recycle_to_bin(
-    paths: Vec<PathBuf>,
-    source: &str,
-    label: &str,
-) -> Result<RecycleResult, String> {
-    if paths.is_empty() || paths.len() > 2_000 {
-        return Err("请选择 1 到 2000 个路径".into());
-    }
-    for p in &paths {
-        path_safe(p)?;
+/// 记录一次清理动作（文件已由调用方移入系统回收站）
+pub fn record_cleanup(paths: Vec<PathBuf>, source: &str, label: &str) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
     }
     let mut entries = read_entries()?;
-    let id = now_string();
-    let group_dir = bin_dir()?.join(&id);
-    fs::create_dir_all(&group_dir).map_err(|e| format!("创建回收组目录失败: {e}"))?;
-
-    let mut items = Vec::new();
-    let mut result = RecycleResult::default();
-    for source_path in paths {
-        if !source_path.exists() {
-            result.failed_items += 1;
-            continue;
-        }
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = source_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".into());
-        let dest = group_dir.join(format!("{seq}-{name}"));
-        match move_entry(&source_path, &dest, &mut result) {
-            Ok(()) => {
-                let relative = dest.strip_prefix(bin_dir()?).unwrap_or(&dest).to_string_lossy().into_owned();
-                items.push(StoredItem {
-                    original: source_path.to_string_lossy().into_owned(),
-                    bin: relative,
-                });
-            }
-            Err(_) => result.failed_items += 1,
-        }
-    }
-    let entry = RecycleEntry {
-        id: id.clone(),
+    let items: Vec<StoredItem> = paths
+        .into_iter()
+        .map(|path| StoredItem {
+            original: path.to_string_lossy().into_owned(),
+            size: size_of_path(&path),
+        })
+        .collect();
+    let total_bytes: u64 = items.iter().map(|item| item.size).sum();
+    entries.push(RecycleEntry {
+        id: now_string(),
         created_at: now_string(),
         source: source.to_string(),
         label: label.to_string(),
-        total_bytes: items
-            .iter()
-            .map(|i| size_of_path(&bin_dir().unwrap().join(&i.bin)))
-            .sum(),
-        file_count: items
-            .iter()
-            .map(|i| count_files(&bin_dir().unwrap().join(&i.bin)))
-            .sum(),
+        total_bytes,
+        file_count: items.len() as u64,
         items,
-    };
-    entries.push(entry);
-    write_entries(&entries)?;
-    Ok(result)
+    });
+    // 最多保留 200 条记录，超出丢弃最旧的
+    if entries.len() > 200 {
+        entries.drain(..entries.len() - 200);
+    }
+    write_entries(&entries)
 }
 
 pub fn list_entries() -> Result<RecycleSummary, String> {
@@ -234,74 +134,80 @@ pub fn list_entries() -> Result<RecycleSummary, String> {
     })
 }
 
-pub fn restore_entry(id: &str) -> Result<RestoreResult, String> {
-    let mut entries = read_entries()?;
-    let entry = entries
-        .iter()
-        .find(|e| e.id == id)
-        .cloned()
-        .ok_or_else(|| String::from("回收条目不存在"))?;
-    let group_dir = bin_dir()?.join(&id);
-    let mut restored = Vec::new();
-    let mut failed = Vec::new();
-    for item in &entry.items {
-        let source = bin_dir()?.join(&item.bin);
-        if !source.exists() {
-            failed.push(format!("桶内缺失: {}", item.original));
+pub fn clear_entries() -> Result<(), String> {
+    write_entries(&[])
+}
+
+/// 统计系统回收站（$Recycle.Bin）占用大小
+pub fn system_bin_bytes() -> u64 {
+    let mut total = 0_u64;
+    for drive_letter in (b'A'..=b'Z').map(|b| (b as char).to_string()) {
+        let root = PathBuf::from(format!("{drive_letter}:\\"));
+        if !root.exists() {
             continue;
         }
-        let original = PathBuf::from(&item.original);
-        // 目标已存在时使用 " (还原)" 后缀，绝不覆盖
-        let mut target = original.clone();
-        if target.exists() {
-            let name = target
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "item".into());
-            let alt = if let Some(dot) = name.rfind('.') {
-                let (stem, ext) = name.split_at(dot);
-                format!("{stem} (还原){ext}")
-            } else {
-                format!("{name} (还原)")
-            };
-            target = target.with_file_name(alt);
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        match move_entry(&source, &target, &mut RecycleResult::default()) {
-            Ok(()) => restored.push(target.to_string_lossy().into_owned()),
-            Err(e) => failed.push(format!("{}: {e}", item.original)),
-        }
+        let bin = root.join("$Recycle.Bin");
+        total = total.saturating_add(size_of_path(&bin));
     }
-    let _ = fs::remove_dir_all(&group_dir);
-    entries.retain(|e| e.id != id);
-    write_entries(&entries)?;
-    Ok(RestoreResult { restored, failed })
+    total
 }
 
-pub fn purge_entry(id: &str) -> Result<(), String> {
-    let mut entries = read_entries()?;
-    let _ = fs::remove_dir_all(bin_dir()?.join(id));
-    entries.retain(|e| e.id != id);
-    write_entries(&entries)
-}
+/// 打开系统回收站窗口
+#[cfg(windows)]
+pub fn open_system_bin() -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-pub fn empty_bin() -> Result<(), String> {
-    let root = bin_dir()?.to_path_buf();
-    fs::remove_file(root.join("entries.json")).ok();
-    for entry in fs::read_dir(&root).map_err(|e| format!("读取回收桶失败: {e}"))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if entry.path().is_dir() {
-            let _ = fs::remove_dir_all(entry.path());
-        } else {
-            let _ = fs::remove_file(entry.path());
-        }
+    let verb: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let target: Vec<u16> =
+        std::ffi::OsStr::new("shell:RecycleBinFolder")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize > 32 {
+        Ok(())
+    } else {
+        Err("无法打开系统回收站".into())
     }
-    Ok(())
 }
 
-/// 历史清理快照（清理前自动记录，供后续对比还原）
+#[cfg(not(windows))]
+pub fn open_system_bin() -> Result<(), String> {
+    Err("此操作仅支持 Windows".into())
+}
+
+/// 清空系统回收站（不可恢复）
+#[cfg(windows)]
+pub fn empty_system_bin() -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::{SHEmptyRecycleBinW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI};
+    let result = unsafe { SHEmptyRecycleBinW(std::ptr::null_mut(), std::ptr::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!("清空系统回收站失败，错误码 {result}"))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn empty_system_bin() -> Result<(), String> {
+    Err("此操作仅支持 Windows".into())
+}
+
+/// 历史清理快照（清理前自动记录，供后续对比查看）
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupSnapshot {
@@ -381,82 +287,33 @@ mod tests {
     use super::*;
 
     fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("disk-analyzer-recycle-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("disk-analyzer-recycle-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
 
     #[test]
-    fn recycle_and_restore_roundtrip() {
-        let root = temp_root("roundtrip");
-        let bin = root.join("bin");
-        let source_dir = root.join("src");
-        fs::create_dir_all(&source_dir.join("sub")).unwrap();
-        fs::write(source_dir.join("a.txt"), "hello".as_bytes()).unwrap();
-        fs::write(source_dir.join("sub").join("b.log"), "world".as_bytes()).unwrap();
+    fn records_cleanup_entries_and_caps_at_200() {
+        let root = temp_root("record");
+        init(root.join("bin")).unwrap();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.txt"), "hello".as_bytes()).unwrap();
 
-        init(bin.clone()).unwrap();
-
-        // 移入回收桶
-        let result = recycle_to_bin(
-            vec![
-                source_dir.join("a.txt"),
-                source_dir.join("sub").join("b.log"),
-            ],
-            "测试",
-            "单测文件",
-        )
-        .unwrap();
-        assert_eq!(result.recycled_files, 2);
-        assert!(result.recycled_bytes > 0);
-        assert!(!source_dir.join("a.txt").exists());
-
-        // 列表可见
+        record_cleanup(vec![src.join("a.txt")], "测试", "单测文件").unwrap();
         let summary = list_entries().unwrap();
         assert_eq!(summary.entries.len(), 1);
-        assert_eq!(summary.total_bytes, 10);
+        assert_eq!(summary.entries[0].file_count, 1);
+        assert_eq!(summary.total_bytes, 5);
 
-        // 还原到原位置（分两次还原模拟冲突：第二次 a.txt 目标已存在）
-        let entry = summary.entries[0].clone();
-        let restore = restore_entry(&entry.id).unwrap();
-        assert_eq!(restore.restored.len(), 2);
-        assert!(source_dir.join("a.txt").exists());
-        assert!(source_dir.join("sub").join("b.log").exists());
+        for _ in 0..210 {
+            record_cleanup(vec![src.join("a.txt")], "测试", "批量").unwrap();
+        }
+        assert_eq!(list_entries().unwrap().entries.len(), 200);
+
+        clear_entries().unwrap();
         assert!(list_entries().unwrap().entries.is_empty());
-
-        // 冲突：目标存在时生成 " (还原)" 后缀，不覆盖
-        fs::write(source_dir.join("c.txt"), "new".as_bytes()).unwrap();
-        let conflict = recycle_to_bin(
-            vec![source_dir.join("c.txt")],
-            "测试",
-            "冲突",
-        )
-        .unwrap();
-        assert_eq!(conflict.recycled_files, 1);
-        fs::write(source_dir.join("c.txt"), "other".as_bytes()).unwrap();
-        let c_entry = list_entries().unwrap().entries[0].clone();
-        let restore2 = restore_entry(&c_entry.id).unwrap();
-        assert_eq!(restore2.restored.len(), 1);
-        assert!(restore2.restored[0].ends_with("(还原).txt"));
-
-        // 清空
-        let _ = recycle_to_bin(vec![source_dir.join("d.txt")], "测试", "清空").unwrap();
-        empty_bin().unwrap();
-        assert!(list_entries().unwrap().entries.is_empty());
-        assert!(!bin.join("entries.json").exists());
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_bin_internal_paths() {
-        let root = temp_root("safety");
-        let bin = root.join("bin");
-        init(bin.clone()).unwrap();
-        let inside = bin.join("entries.json");
-        let result = recycle_to_bin(vec![inside], "测试", "非法");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("回收桶内部"));
         let _ = fs::remove_dir_all(&root);
     }
 }

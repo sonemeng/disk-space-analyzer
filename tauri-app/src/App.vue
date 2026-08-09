@@ -277,6 +277,10 @@ const showRecycleBin = ref(false)
 const recycleEntries = ref<RecycleEntry[]>([])
 const recycleTotalBytes = ref(0)
 const recycleBusy = ref('')
+const systemRecycleBytes = ref(0)
+const confirmEmptySystemBin = ref(false)
+let emptyBinConfirmTimer: number | undefined
+const cleanupProgress = ref<{ message: string; percent: number } | null>(null)
 const showCleanupHistory = ref(false)
 const cleanupHistory = ref<CleanupSnapshot[]>([])
 const cleanupHistoryBusy = ref('')
@@ -295,6 +299,7 @@ let cleanupRequestId = 0
 let unlisten: UnlistenFn | undefined
 let unlistenFolder: UnlistenFn | undefined
 let unlistenDuplicate: UnlistenFn | undefined
+let unlistenCleanup: UnlistenFn | undefined
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
 let errorTimer: ReturnType<typeof setTimeout> | undefined
@@ -1889,39 +1894,44 @@ async function loadRecycleBin() {
 
 async function openRecycleBin() {
   showRecycleBin.value = true
-  await loadRecycleBin()
+  await Promise.all([loadRecycleBin(), loadSystemRecycleBytes()])
 }
 
-async function restoreRecycleEntry(id: string) {
-  recycleBusy.value = id
+async function loadSystemRecycleBytes() {
+  if (!isTauri) return
+  try { systemRecycleBytes.value = await invoke<number>('system_recycle_bin_bytes') } catch { /* 忽略 */ }
+}
+
+async function openSystemRecycleBin() {
   try {
-    const result = await invoke<{ restored: string[]; failed: string[] }>('restore_recycle_item', { id })
-    if (result.failed.length) {
-      showNotice(`还原完成 ${result.restored.length} 项，失败 ${result.failed.length} 项：${result.failed.join('；')}`, 5000, 'error')
-    } else {
-      showNotice(`已还原 ${result.restored.length} 项到原位置`, 3000, 'recycle')
-    }
-    await Promise.all([loadRecycleBin(), refreshUsage()])
+    await invoke('open_system_recycle_bin')
   } catch (value) { handleError(value) }
-  finally { recycleBusy.value = '' }
 }
 
-async function purgeRecycleEntry(id: string) {
-  recycleBusy.value = `purge:${id}`
-  try {
-    await invoke('purge_recycle_item', { id })
-    showNotice('已彻底删除该回收条目（不可恢复）', 3000, 'recycle')
-    await loadRecycleBin()
-  } catch (value) { handleError(value) }
-  finally { recycleBusy.value = '' }
-}
-
-async function emptyRecycleBin() {
+async function emptySystemRecycleBin() {
+  if (!confirmEmptySystemBin.value) {
+    confirmEmptySystemBin.value = true
+    showNotice('再次点击「清空系统回收站」才真正清空（影响所有磁盘）', 3500, 'notice')
+    if (emptyBinConfirmTimer) clearTimeout(emptyBinConfirmTimer)
+    emptyBinConfirmTimer = window.setTimeout(() => { confirmEmptySystemBin.value = false }, 3500)
+    return
+  }
   recycleBusy.value = 'empty'
   try {
-    await invoke('empty_recycle_bin')
-    showNotice('回收站已清空', 3000, 'recycle')
-    await Promise.all([loadRecycleBin(), refreshUsage()])
+    await invoke('empty_system_recycle_bin')
+    showNotice('系统回收站已清空（文件不可恢复）', 4000, 'recycle')
+    confirmEmptySystemBin.value = false
+    await Promise.all([loadSystemRecycleBytes(), refreshUsage()])
+  } catch (value) { handleError(value) }
+  finally { recycleBusy.value = '' }
+}
+
+async function clearRecycleEntries() {
+  recycleBusy.value = 'entries'
+  try {
+    await invoke('clear_recycle_entries')
+    showNotice('已清空应用清理记录（不影响系统回收站）', 3000, 'recycle')
+    await loadRecycleBin()
   } catch (value) { handleError(value) }
   finally { recycleBusy.value = '' }
 }
@@ -2091,6 +2101,8 @@ watch(
   { deep: true },
 )
 
+watch(showSettings, async (open) => { if (open) await loadSystemRecycleBytes() })
+
 function onGlobalKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (selectedActivity.value) {
@@ -2163,6 +2175,7 @@ onMounted(async () => {
     unlisten = await listen<ScanProgress>('scan-progress', event => { progress.value = event.payload })
     unlistenFolder = await listen<ScanProgress>('folder-progress', event => { folderProgress.value = event.payload })
     unlistenDuplicate = await listen<ScanProgress>('duplicate-progress', event => { duplicateProgress.value = event.payload })
+    unlistenCleanup = await listen<{ message: string; percent: number }>('cleanup-progress', event => { cleanupProgress.value = event.payload })
   }
   await loadDrives()
   // 清理分析只在「完整扫描」完成后执行，启动/换盘不扫
@@ -2171,7 +2184,7 @@ onMounted(async () => {
   if (autoCheckUpdates.value) void checkUpdates(true)
 })
 onBeforeUnmount(() => {
-  unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.()
+  unlisten?.(); unlistenFolder?.(); unlistenDuplicate?.(); unlistenCleanup?.()
   window.removeEventListener('keydown', onGlobalKeydown)
   if (noticeTimer) clearTimeout(noticeTimer)
   if (noticeFadeTimer) clearTimeout(noticeFadeTimer)
@@ -2204,7 +2217,6 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="sidebar-spacer" />
-      <button class="settings-trigger" title="应用回收桶：已清理文件可一键还原到原位置" @click="openRecycleBin"><Recycle :size="17" /><span><b>回收站</b><small v-if="recycleTotalBytes">{{ formatSize(recycleTotalBytes) }} · 可还原</small><small v-else>已清理文件暂存于此</small></span><ChevronRight :size="15" /></button>
       <button class="settings-trigger" title="设置" @click="showSettings = true"><Settings :size="17" /><span><b>设置</b><small>{{ themeOptions.find(theme => theme.id === activeTheme)?.name }} · {{ fontScale === 'large' ? '大字号' : fontScale === 'small' ? '小字号' : '标准字号' }}</small></span><ChevronRight :size="15" /></button>
       <div class="safety-note"><ShieldCheck :size="17" /><div><b>默认只读</b><span>只有低风险白名单项目可在确认后清理</span></div></div>
       <div v-if="!isTauri" class="preview-badge"><Info :size="14" /> 界面预览</div>
@@ -2457,7 +2469,6 @@ onBeforeUnmount(() => {
             <div class="cleanup-toolbar">
 <div><h2>清理建议</h2><p title="切换上方分类后，「选择本类可处理」只作用于当前分类">强确认项需手动勾选，不会被本类全选带上</p></div>
               <div class="cleanup-actions">
-                <button class="button secondary" title="查看应用回收桶中的已清理文件，可还原到原位置" @click="openRecycleBin"><Recycle :size="16" /> 回收站<span v-if="recycleTotalBytes"> {{ formatSize(recycleTotalBytes) }}</span></button>
                 <button class="text-button" title="查看清理前自动生成的目录+大小快照，清空回收站后仍可对照" @click="openCleanupHistory">清理记录</button>
                 <button class="text-button" :disabled="!selectableInTab.length" @click="toggleAllSafe">{{ allTabSelectableSelected ? '取消本类选择' : '选择本类可清理项' }}</button>
                 <button class="button secondary" :disabled="!selectedCleanup.length || cleaning || previewingCleanup" @click="previewCleanup"><LoaderCircle v-if="previewingCleanup" :size="16" class="spin" /><Search v-else :size="16" /> 预览释放量</button>
@@ -2988,7 +2999,7 @@ onBeforeUnmount(() => {
 
         <div v-else-if="settingsTab === 'system'" class="settings-content">
           <section class="setting-section"><div class="setting-title"><div><b>报告保存位置</b><small>HTML 报告和诊断信息默认写入此目录</small></div><button class="button secondary compact" @click="chooseReportDirectory"><FolderOpen :size="15" /> 选择</button></div><div class="setting-path"><span :title="reportDirectory">{{ reportDirectory || '桌面（系统默认）' }}</span><button v-if="reportDirectory" title="恢复默认位置" @click="reportDirectory = ''"><X :size="15" /></button></div></section>
-          <section class="setting-section"><div class="setting-title"><div><b>回收站策略</b><small>清理/回收的媒体文件先进应用回收桶，可一键还原，非永久删除</small></div><Recycle :size="19" /></div><div class="chip-row"><button type="button" class="chip-btn" :class="{ active: recyclePolicy === 'confirm' }" @click="recyclePolicy = 'confirm'">每次确认</button><button type="button" class="chip-btn" :class="{ active: recyclePolicy === 'direct' }" @click="recyclePolicy = 'direct'">直接移入回收站</button></div></section>
+          <section class="setting-section"><div class="setting-title"><div><b>回收站</b><small>删除的文件一律进 Windows 系统回收站（资源管理器可见、可右键还原），应用内只保留清理记录</small></div><Recycle :size="19" /></div><div class="chip-row"><button type="button" class="chip-btn" :class="{ active: recyclePolicy === 'confirm' }" @click="recyclePolicy = 'confirm'">每次确认</button><button type="button" class="chip-btn" :class="{ active: recyclePolicy === 'direct' }" @click="recyclePolicy = 'direct'">直接移入回收站</button></div><div class="setting-action-row recycle-settings-row"><span class="recycle-bin-usage"><Recycle :size="15" /> 系统回收站占用 <b>{{ systemRecycleBytes ? formatSize(systemRecycleBytes) : '—' }}</b></span><button class="button secondary compact" @click="openSystemRecycleBin"><FolderOpen :size="15" /> 打开系统回收站</button><button class="button danger compact" :class="{ confirm: confirmEmptySystemBin }" @click="emptySystemRecycleBin"><LoaderCircle v-if="recycleBusy === 'empty'" :size="15" class="spin" /><Trash2 v-else :size="15" /> {{ confirmEmptySystemBin ? '再次点击确认清空' : '清空系统回收站' }}</button><button class="text-button" @click="openRecycleBin">清理记录</button></div></section>
           <section class="setting-section"><div class="setting-title"><div><b>启动时检查更新</b><small>通过 GitHub Releases 检查公开发布版本</small></div><button class="toggle-switch" role="switch" :aria-checked="autoCheckUpdates" :class="{ active: autoCheckUpdates }" @click="autoCheckUpdates = !autoCheckUpdates"><i /></button></div><div class="setting-action-row"><span :class="{ success: updateStatus && !updateStatus.available, update: updateStatus?.available }">{{ updateStatus?.message || '尚未检查更新' }}</span><button class="button secondary compact" :disabled="settingsBusy === 'update'" @click="checkUpdates()"><LoaderCircle v-if="settingsBusy === 'update'" :size="15" class="spin" /><RefreshCw v-else :size="15" /> 立即检查</button></div></section>
           <section class="setting-section system-actions"><div><div><b>诊断信息</b><small>导出版本、平台、设置和快照状态，不包含文件内容</small></div><button class="button secondary compact" :disabled="settingsBusy === 'diagnostics'" @click="exportDiagnostics"><LoaderCircle v-if="settingsBusy === 'diagnostics'" :size="15" class="spin" /><Download v-else :size="15" /> 导出诊断</button></div><div><div><b>本地扫描历史</b><small>清除全部磁盘空间快照，不会删除文件</small></div><button class="button danger compact" @click="confirmClearHistory = true"><Trash2 :size="15" /> 清除历史</button></div></section>
         </div>
@@ -3103,7 +3114,7 @@ onBeforeUnmount(() => {
         <button class="dialog-close" aria-label="关闭" @click="confirmRecycleFiles = false"><X :size="18" /></button>
         <span class="dialog-icon"><Recycle :size="26" /></span>
         <h2>将 {{ recycleTargetPaths.length }} 个文件移入回收站？</h2>
-        <p>合计约 {{ formatSize(recycleTargetBytes) }}。不会永久删除，可在应用回收站一键还原到原位置。</p>
+        <p>合计约 {{ formatSize(recycleTargetBytes) }}。不会永久删除，将进入 Windows 系统回收站，可在资源管理器中还原。</p>
         <div class="dialog-actions">
           <button class="button secondary" :disabled="recyclingFiles" @click="confirmRecycleFiles = false">取消</button>
           <button class="button primary" :disabled="recyclingFiles" @click="runRecycleFiles">
@@ -3120,7 +3131,7 @@ onBeforeUnmount(() => {
         <button class="dialog-close" aria-label="关闭" @click="confirmCleanup = false"><X :size="18" /></button>
         <span class="dialog-icon"><Trash2 :size="24" /></span>
         <h2 id="confirm-title">确认移入回收站 {{ formatSize(selectedCleanupBytes) }}？</h2>
-        <p>磁盘 <b>{{ selectedDrive }}</b> · 共 {{ selectedCleanupItems.length }} 项 · 约 {{ formatSize(selectedCleanupBytes) }}。一律进应用回收桶（可在清理中心一键还原），非永久删除。热目录/占用文件会自动跳过。</p>
+        <p>磁盘 <b>{{ selectedDrive }}</b> · 共 {{ selectedCleanupItems.length }} 项 · 约 {{ formatSize(selectedCleanupBytes) }}。一律进 Windows 系统回收站（可还原），非永久删除。热目录/占用文件会自动跳过。</p>
         <div class="confirm-items"><div v-for="item in selectedCleanupItems" :key="item.id"><Check :size="14" /><span>{{ item.name }}{{ item.category === 'developer' ? ' · 开发' : item.category === 'app' ? ' · 应用缓存' : item.requiresStrongConfirm ? ' · 模型/强确认' : item.category === 'toolai' ? ' · 工具/AI' : '' }}</span><b>{{ formatSize(item.size) }}</b></div></div>
         <div v-if="selectedHasModelItems" class="model-strong-box">
           <div class="model-strong-head">
@@ -3146,18 +3157,24 @@ onBeforeUnmount(() => {
             />
           </div>
         </div>
+        <div v-if="cleanupProgress" class="cleanup-progress"><div class="cleanup-progress-info"><LoaderCircle :size="14" class="spin" /><span>{{ cleanupProgress.message }}</span><b>{{ cleanupProgress.percent }}%</b></div><div class="cleanup-progress-bar"><i :style="{ width: cleanupProgress.percent + '%' }" /></div></div>
         <div class="dialog-actions"><button class="button secondary" :disabled="cleaning || previewingCleanup" @click="confirmCleanup = false">取消</button><button class="button secondary" :disabled="!selectedCleanup.length || cleaning || previewingCleanup" @click="previewCleanup"><LoaderCircle v-if="previewingCleanup" :size="16" class="spin" /><Search v-else :size="16" /> 先预览</button><button class="button danger-solid" :disabled="cleaning || (selectedHasModelItems && (!modelStrongConfirm || modelConfirmPhrase.trim() !== '确认删除模型缓存'))" @click="runCleanup"><LoaderCircle v-if="cleaning" :size="16" class="spin" /><Trash2 v-else :size="16" /> {{ cleaning ? '正在移入' : '确认移入回收站' }}</button></div>
       </section>
     </div>
 
     <div v-if="showRecycleBin" class="modal-backdrop" @click.self="showRecycleBin = false">
-      <section class="confirm-dialog recycle-bin-dialog" role="dialog" aria-modal="true" aria-label="回收站">
+      <section class="confirm-dialog recycle-bin-dialog" role="dialog" aria-modal="true" aria-label="回收站与清理记录">
         <button class="dialog-close" aria-label="关闭" @click="showRecycleBin = false"><X :size="18" /></button>
         <span class="dialog-icon"><Recycle :size="26" /></span>
-        <h2>回收站</h2>
-        <p>清理/回收会先进入此处（应用内回收桶），可一键还原到原位置；确认无误后可彻底删除。<b v-if="recycleTotalBytes"> 共占用 {{ formatSize(recycleTotalBytes) }}</b></p>
-        <div v-if="recycleBusy === 'empty'" class="recycle-bin-tip"><LoaderCircle :size="15" class="spin" /> 正在清空…</div>
-        <div v-else-if="!recycleEntries.length" class="recycle-bin-tip"><ShieldCheck :size="18" /> 回收站为空，移入的文件会出现在这里并可还原</div>
+        <h2>回收站与清理记录</h2>
+        <p>删除的文件都在 <b>Windows 系统回收站</b> 中，资源管理器里右键即可还原到原位置（不额外占空间、卸载无残留）。下方是应用内每次清理留下的记录。<b v-if="systemRecycleBytes"> 当前系统回收站占用 {{ formatSize(systemRecycleBytes) }}</b></p>
+        <div class="recycle-actions-row">
+          <button class="button secondary compact" @click="openSystemRecycleBin"><FolderOpen :size="15" /> 打开系统回收站</button>
+          <button class="button danger compact" :class="{ confirm: confirmEmptySystemBin }" @click="emptySystemRecycleBin"><LoaderCircle v-if="recycleBusy === 'empty'" :size="15" class="spin" /><Trash2 v-else :size="15" /> {{ confirmEmptySystemBin ? '再次点击确认清空' : '清空系统回收站' }}</button>
+        </div>
+        <div class="recycle-bin-subtitle"><History :size="15" /> 应用清理记录（{{ recycleEntries.length }} 条）</div>
+        <div v-if="recycleBusy === 'entries'" class="recycle-bin-tip"><LoaderCircle :size="15" class="spin" /> 正在清空记录…</div>
+        <div v-else-if="!recycleEntries.length" class="recycle-bin-tip"><ShieldCheck :size="18" /> 暂无清理记录</div>
         <div v-else class="recycle-bin-list">
           <div v-for="entry in recycleEntries" :key="entry.id" class="recycle-bin-group">
             <div class="recycle-bin-head">
@@ -3170,8 +3187,6 @@ onBeforeUnmount(() => {
                 <b>{{ formatSize(entry.totalBytes) }}</b>
                 <small>{{ formatCount(entry.fileCount) }} 项</small>
               </div>
-              <button class="button secondary compact" :disabled="recycleBusy === entry.id" @click="restoreRecycleEntry(entry.id)"><LoaderCircle v-if="recycleBusy === entry.id" :size="15" class="spin" /><Undo2 v-else :size="15" /> 还原</button>
-              <button class="button danger-solid compact" :disabled="recycleBusy === `purge:${entry.id}`" @click="purgeRecycleEntry(entry.id)"><LoaderCircle v-if="recycleBusy === `purge:${entry.id}`" :size="15" class="spin" /><Trash2 v-else :size="15" /> 彻底删除</button>
             </div>
             <details class="recycle-bin-detail">
               <summary>查看原路径清单（{{ entry.items.length }} 个顶层路径）</summary>
@@ -3182,7 +3197,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="dialog-actions">
-          <button class="button danger-solid" :disabled="!recycleEntries.length || recycleBusy === 'empty'" @click="emptyRecycleBin"><LoaderCircle v-if="recycleBusy === 'empty'" :size="16" class="spin" /><Trash2 v-else :size="16" /> 清空回收站</button>
+          <button class="button secondary" :disabled="!recycleEntries.length || recycleBusy === 'entries'" @click="clearRecycleEntries"><LoaderCircle v-if="recycleBusy === 'entries'" :size="16" class="spin" /><Trash2 v-else :size="16" /> 清空记录</button>
           <button class="button primary" @click="showRecycleBin = false">关闭</button>
         </div>
       </section>
@@ -3305,6 +3320,13 @@ onBeforeUnmount(() => {
 .recycle-bin-detail ul{list-style:none;margin:6px 0 0;padding:0;max-height:180px;overflow:auto;display:grid;gap:2px}
 .recycle-bin-detail li{font-size:11px;color:#475467;font-family:Consolas,"Courier New",monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .recycle-bin-detail li em{font-style:normal;color:#98a2b3}
+.recycle-actions-row{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 10px}
+.recycle-bin-subtitle{display:flex;align-items:center;gap:6px;font-size:12px;color:#344054;font-weight:600;margin:2px 0 8px}
+.cleanup-progress{margin:2px 0 12px;display:grid;gap:6px}
+.cleanup-progress-info{display:flex;align-items:center;gap:6px;font-size:12px;color:#344054}
+.cleanup-progress-info b{color:#c94331}
+.cleanup-progress-bar{height:6px;border-radius:4px;background:#e4e7eb;overflow:hidden}
+.cleanup-progress-bar i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#3b82f6,#2dd4bf);transition:width .3s ease}
 .message-log-list{max-height:320px; overflow:auto; display:grid; gap:8px; margin:12px 0 16px}
 .message-log-row{border:1px solid #e4e7eb; border-radius:6px; padding:10px 12px; background:#fafbfc}
 .message-log-row.error{border-color:#ffcaca; background:#fff7f7}

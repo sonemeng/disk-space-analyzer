@@ -1180,13 +1180,13 @@ async fn recycle_media(paths: Vec<String>) -> Result<RecycleResult, String> {
         if pathbufs.is_empty() || pathbufs.len() > 1_000 {
             return Err("请选择 1 到 1000 个媒体文件".into());
         }
-        recycle::recycle_to_bin(pathbufs, "媒体中心", "媒体文件")
+        trash_and_record(&pathbufs, "媒体中心", "媒体文件")
     })
     .await
-    .map_err(|error| format!("回收站任务异常: {error}"))?
+    .map_err(|error| format!("回收任务异常: {error}") )?
 }
 
-/// 通用文件移入应用回收桶（文件审查 / 重复文件等）
+/// 通用文件移入系统回收站（文件审查 / 重复文件等），并记录清理日志
 #[tauri::command]
 async fn recycle_paths(
     paths: Vec<String>,
@@ -1196,39 +1196,74 @@ async fn recycle_paths(
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let source = source.unwrap_or_else(|| "文件审查".into());
     let label = label.unwrap_or_else(|| "文件回收".into());
-    tauri::async_runtime::spawn_blocking(move || recycle::recycle_to_bin(pathbufs, &source, &label))
+    tauri::async_runtime::spawn_blocking(move || trash_and_record(&pathbufs, &source, &label))
         .await
-        .map_err(|e| format!("回收站任务异常: {e}"))?
+        .map_err(|e| format!("回收任务异常: {e}"))?
+}
+
+/// 将路径移入 Windows 系统回收站，成功者记入应用清理日志
+fn trash_and_record(pathbufs: &[PathBuf], source: &str, label: &str) -> Result<RecycleResult, String> {
+    let mut trashed: Vec<PathBuf> = Vec::new();
+    let mut recycled_bytes = 0_u64;
+    let mut failed = 0_u64;
+    for path in pathbufs {
+        match trash::delete(path) {
+            Ok(_) => {
+                recycled_bytes = recycled_bytes.saturating_add(size_of(path));
+                trashed.push(path.clone());
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("[recycle] 移入系统回收站失败 {}: {e}", path.display());
+            }
+        }
+    }
+    if !trashed.is_empty() {
+        if let Err(e) = recycle::record_cleanup(trashed, source, label) {
+            eprintln!("[recycle] 记录清理日志失败: {e}");
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} 个项目未能移入系统回收站"));
+    }
+    Ok(RecycleResult {
+        recycled_files: pathbufs.len() as u64,
+        recycled_bytes,
+        failed_items: failed,
+    })
 }
 
 #[tauri::command]
 async fn list_recycle_items() -> Result<recycle::RecycleSummary, String> {
     tauri::async_runtime::spawn_blocking(recycle::list_entries)
         .await
-        .map_err(|e| format!("读取回收桶异常: {e}"))?
+        .map_err(|e| format!("读取清理记录异常: {e}"))?
 }
 
 #[tauri::command]
-async fn restore_recycle_item(id: String) -> Result<recycle::RestoreResult, String> {
-    let id = id.clone();
-    tauri::async_runtime::spawn_blocking(move || recycle::restore_entry(&id))
+async fn clear_recycle_entries() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(recycle::clear_entries)
         .await
-        .map_err(|e| format!("还原任务异常: {e}"))?
+        .map_err(|e| format!("清空清理记录异常: {e}"))?
 }
 
 #[tauri::command]
-async fn purge_recycle_item(id: String) -> Result<(), String> {
-    let id = id.clone();
-    tauri::async_runtime::spawn_blocking(move || recycle::purge_entry(&id))
-        .await
-        .map_err(|e| format!("删除回收条目异常: {e}"))?
+async fn open_system_recycle_bin() -> Result<(), String> {
+    recycle::open_system_bin()
 }
 
 #[tauri::command]
-async fn empty_recycle_bin() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(recycle::empty_bin)
+async fn empty_system_recycle_bin() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(recycle::empty_system_bin)
         .await
-        .map_err(|e| format!("清空回收桶异常: {e}"))?
+        .map_err(|e| format!("清空系统回收站异常: {e}"))?
+}
+
+#[tauri::command]
+async fn system_recycle_bin_bytes() -> Result<u64, String> {
+    Ok(tauri::async_runtime::spawn_blocking(recycle::system_bin_bytes)
+        .await
+        .map_err(|e| format!("统计系统回收站失败: {e}"))?)
 }
 
 #[tauri::command]
@@ -2082,13 +2117,12 @@ fn size_of(path: &Path) -> u64 {
     }
 }
 
-fn flush_recycle(queued: &mut Vec<PathBuf>, source: &str, label: &str) -> Result<(), String> {
+fn flush_cleanup_log(queued: &mut Vec<PathBuf>, source: &str, label: &str) -> Result<(), String> {
     if queued.is_empty() {
         return Ok(());
     }
     let paths = std::mem::take(queued);
-    recycle::recycle_to_bin(paths, source, label)?;
-    Ok(())
+    trash_and_record(&paths, source, label).map(|_| ())
 }
 
 fn clean_definition(
@@ -2150,7 +2184,7 @@ trash_path(root, queued);
             result.freed_bytes = result.freed_bytes.saturating_add(size);
             result.deleted_files = result.deleted_files.saturating_add(files.max(1));
         }
-        let _ = flush_recycle(queued, "清理中心", &definition.name);
+        let _ = flush_cleanup_log(queued, "清理中心", &definition.name);
         return result;
     }
 
@@ -2194,7 +2228,7 @@ trash_path(entry.path(), queued);
                 result.deleted_files += 1;
         }
     }
-    let _ = flush_recycle(queued, "清理中心", &definition.name);
+    let _ = flush_cleanup_log(queued, "清理中心", &definition.name);
     result
 }
 
@@ -2243,7 +2277,7 @@ fn clean_app_path(
     trash_path(path, queued);
     result.freed_bytes = size;
     result.deleted_files = files.max(1);
-    let _ = flush_recycle(queued, "清理中心", rule_id);
+    let _ = flush_cleanup_log(queued, "清理中心", rule_id);
     result
 }
 
@@ -2298,12 +2332,13 @@ fn clean_toolai_path(
     trash_path(path, queued);
     result.freed_bytes = size;
     result.deleted_files = files.max(1);
-    let _ = flush_recycle(queued, "清理中心", rule_id);
+    let _ = flush_cleanup_log(queued, "清理中心", rule_id);
     result
 }
 
 #[tauri::command]
 async fn clean_items(
+    app: AppHandle,
     drive: String,
     ids: Vec<String>,
     dry_run: Option<bool>,
@@ -2429,7 +2464,22 @@ async fn clean_items(
             }
         }
         let mut queued: Vec<PathBuf> = Vec::new();
-        for id in &requested {
+        let requested_vec: Vec<String> = requested.iter().cloned().collect();
+        let total_n = requested_vec.len();
+        for (idx, id) in requested_vec.iter().enumerate() {
+            let pct = ((idx as f32 / total_n.max(1) as f32) * 80.0) as u8 + 5;
+            emit_progress_event(
+                &app,
+                "cleanup-progress",
+                format!(
+                    "正在清理第 {} / {} 项{}",
+                    idx + 1,
+                    total_n,
+                    if dry_run { "（预演）" } else { "" }
+                ),
+                pct,
+                None,
+            );
             if id.starts_with("toolai:") {
                 if let Some((rule_id, path)) = tool_ai_rules::parse_toolai_id(id) {
                     let result = clean_toolai_path(
@@ -2484,6 +2534,13 @@ async fn clean_items(
                 eprintln!("[cleanup] 已保存清理快照 {_snap_id}");
             }
         }
+        emit_progress_event(
+            &app,
+            "cleanup-progress",
+            "清理完成",
+            100,
+            None,
+        );
         Ok(total)
     })
     .await
@@ -2765,9 +2822,10 @@ start_scan,
             recycle_media,
             recycle_paths,
             list_recycle_items,
-            restore_recycle_item,
-            purge_recycle_item,
-            empty_recycle_bin,
+            clear_recycle_entries,
+            open_system_recycle_bin,
+            empty_system_recycle_bin,
+            system_recycle_bin_bytes,
             list_cleanup_snapshots,
             delete_cleanup_snapshot,
             analyze_registry,
