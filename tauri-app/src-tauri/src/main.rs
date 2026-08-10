@@ -2,10 +2,14 @@
 
 mod app_cache_rules;
 mod dev_rules;
+mod disk_health;
 mod media;
+mod port_tools;
 mod recycle;
 mod registry;
+mod startup_tools;
 mod tool_ai_rules;
+mod win_cmd;
 
 use media::{MediaScanOptions, MediaScanResult, RecycleResult};
 use serde::{Deserialize, Serialize};
@@ -1264,6 +1268,61 @@ async fn system_recycle_bin_bytes() -> Result<u64, String> {
     Ok(tauri::async_runtime::spawn_blocking(recycle::system_bin_bytes)
         .await
         .map_err(|e| format!("统计系统回收站失败: {e}"))?)
+}
+
+// ---- 系统工具：启动项 / 端口 / 磁盘健康 / 测速 ----
+
+#[tauri::command]
+async fn list_startup_items() -> Result<Vec<startup_tools::StartupItem>, String> {
+    tauri::async_runtime::spawn_blocking(startup_tools::list_startup_items)
+        .await
+        .map_err(|e| format!("读取启动项失败: {e}"))?
+}
+
+#[tauri::command]
+async fn disable_startup_item(key: String) -> Result<(), String> {
+    let key = key.clone();
+    tauri::async_runtime::spawn_blocking(move || startup_tools::disable_startup_item(&key))
+        .await
+        .map_err(|e| format!("禁用启动项失败: {e}"))?
+}
+
+#[tauri::command]
+async fn enable_startup_item(key: String) -> Result<(), String> {
+    let key = key.clone();
+    tauri::async_runtime::spawn_blocking(move || startup_tools::enable_startup_item(&key))
+        .await
+        .map_err(|e| format!("恢复启动项失败: {e}"))?
+}
+
+#[tauri::command]
+async fn list_ports() -> Result<Vec<port_tools::PortEntry>, String> {
+    tauri::async_runtime::spawn_blocking(port_tools::list_ports)
+        .await
+        .map_err(|e| format!("读取端口表失败: {e}"))?
+}
+
+#[tauri::command]
+async fn kill_process(pid: u64, force: Option<bool>) -> Result<(), String> {
+    let force = force.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || port_tools::kill_process(pid, force))
+        .await
+        .map_err(|e| format!("终止进程失败: {e}"))?
+}
+
+#[tauri::command]
+async fn disk_health() -> Result<disk_health::DiskHealthReport, String> {
+    tauri::async_runtime::spawn_blocking(disk_health::disk_health)
+        .await
+        .map_err(|e| format!("读取磁盘健康失败: {e}"))?
+}
+
+#[tauri::command]
+async fn run_speed_test(drive: String) -> Result<disk_health::SpeedTestResult, String> {
+    let drive = drive.clone();
+    tauri::async_runtime::spawn_blocking(move || disk_health::run_speed_test(&drive))
+        .await
+        .map_err(|e| format!("测速失败: {e}"))?
 }
 
 #[tauri::command]
@@ -2811,6 +2870,7 @@ tauri::Builder::default()
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let _ = DATA_ROOT.set(data_dir.clone());
             recycle::init(data_dir.join("recycle-bin"))?;
+            startup_tools::init(data_dir.join("system-tools"))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2826,6 +2886,13 @@ start_scan,
             open_system_recycle_bin,
             empty_system_recycle_bin,
             system_recycle_bin_bytes,
+            list_startup_items,
+            disable_startup_item,
+            enable_startup_item,
+            list_ports,
+            kill_process,
+            disk_health,
+            run_speed_test,
             list_cleanup_snapshots,
             delete_cleanup_snapshot,
             analyze_registry,

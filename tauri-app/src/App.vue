@@ -4,10 +4,12 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
+  Activity,
   AlertTriangle,
   ArrowLeft,
   BarChart3,
   Ban,
+  Bookmark,
   CalendarClock,
   ChartNoAxesCombined,
   Check,
@@ -34,6 +36,8 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Play,
+  Power,
+  RadioTower,
   RefreshCw,
   Recycle,
   Search,
@@ -45,6 +49,7 @@ import {
   Undo2,
   Wrench,
   X,
+  Zap,
 } from '@lucide/vue'
 import MediaCenter from './MediaCenter.vue'
 import RegistryCleaner from './RegistryCleaner.vue'
@@ -183,7 +188,7 @@ interface AdvancedSettings {
   autoCheckUpdates: boolean
 }
 
-const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '6.2.3'
+const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '6.3.0'
 const isTauri = '__TAURI_INTERNALS__' in window
 type ThemeId = 'ocean' | 'forest' | 'coral' | 'cherry' | 'graphite' | 'mintrose' | 'lavenderteal'
 type FontScale = 'small' | 'standard' | 'large'
@@ -241,7 +246,8 @@ const cleaning = ref(false)
 const previewingCleanup = ref(false)
 const loadingDrives = ref(true)
 const loadingCleanup = ref(false)
-const page = ref<'overview' | 'cleanup' | 'files' | 'insights' | 'media' | 'registry'>('overview')
+const page = ref<'overview' | 'cleanup' | 'files' | 'insights' | 'media' | 'registry' | 'tools'>('overview')
+const toolsTab = ref<'startup' | 'ports' | 'health' | 'speed'>('startup')
 const analysisTab = ref<'duplicates' | 'history' | 'age' | 'attribution' | 'types' | 'actions'>('duplicates')
 const fileTab = ref<'directories' | 'files' | 'types'>('directories')
 const attributionFocus = ref<'regions' | 'projects'>('regions')
@@ -469,6 +475,23 @@ const shadeStyle = computed(() => {
 const latestSnapshot = computed(() => snapshots.value[snapshots.value.length - 1] ?? null)
 const previousSnapshot = computed(() => snapshots.value[snapshots.value.length - 2] ?? null)
 const snapshotDelta = computed(() => latestSnapshot.value && previousSnapshot.value ? latestSnapshot.value.used - previousSnapshot.value.used : 0)
+
+const trendLine = computed(() => {
+  const s = snapshots.value
+  if (s.length < 2) return null
+  const pad = 34, w = 640, h = 200
+  const max = Math.max(...s.map((x) => x.used))
+  const min = Math.min(...s.map((x) => x.used))
+  const span = max - min || 1
+  const pts = s.map((x, i) => {
+    const px = pad + (i / (s.length - 1)) * (w - pad * 2)
+    const py = h - 26 - ((x.used - min) / span) * (h - 52)
+    return { px, py, x }
+  })
+  const line = pts.map((p) => `${p.px.toFixed(1)},${p.py.toFixed(1)}`).join(' ')
+  const area = `M ${pts[0].px},${h - 26} L ${line.split(' ').join(' L ')} L ${pts[pts.length - 1].px},${h - 26} Z`
+  return { pts, line, area }
+})
 const snapshotDiff = computed(() => {
   const newer = latestSnapshot.value
   const older = previousSnapshot.value
@@ -712,7 +735,7 @@ const actionChecklist = computed(() => {
   return items
 })
 
-const pageTitle = computed(() => ({ overview: '空间概览', cleanup: '清理中心', files: '文件审查', insights: '深度分析', media: '媒体管理', registry: '注册表检查' }[page.value]))
+const pageTitle = computed(() => ({ overview: '空间概览', cleanup: '清理中心', files: '文件审查', insights: '深度分析', media: '媒体管理', registry: '注册表检查', tools: '系统工具' }[page.value]))
 const scanOptions = computed(() => ({
   exclusions: exclusionPaths.value,
   largeFileBytes: largeFileMb.value * 1024 * 1024,
@@ -1977,6 +2000,144 @@ function buildPreviewFolder(path: string): FolderAnalysis {
   }
 }
 
+// ---- 系统工具：启动项 / 端口 / 磁盘健康 / 测速 ----
+
+interface StartupItem {
+  name: string
+  command: string
+  location: string
+  enabled: boolean
+  filePath: string | null
+  key: string
+}
+interface PortEntry {
+  protocol: string
+  localAddress: string
+  localPort: string
+  remoteAddress: string
+  remotePort: string
+  state: string
+  pid: number
+  process: string
+}
+interface DiskHealthReport {
+  drives: { index: number; model: string; serial: string; interface: string; mediaType: string; sizeBytes: number; status: string }[]
+  smartOk: boolean | null
+}
+interface SpeedTestResult {
+  drive: string
+  seqWriteMbps: number
+  seqReadMbps: number
+  randRead4kIops: number
+  randRead4kMbps: number
+  testBytes: number
+}
+
+const toolsBusy = ref('')
+const startupItems = ref<StartupItem[]>([])
+const ports = ref<PortEntry[]>([])
+const portFilter = ref('')
+const portFilterState = ref<'all' | 'listening'>('all')
+const killArmPid = ref(0)
+let killArmTimer: number | undefined
+const health = ref<DiskHealthReport | null>(null)
+const speedDrive = ref('')
+const speedResult = ref<SpeedTestResult | null>(null)
+const favorites = ref<string[]>(JSON.parse(localStorage.getItem('disk-analyzer-favorites') || '[]'))
+
+async function loadStartupItems() {
+  if (!isTauri) return
+  toolsBusy.value = 'startup'
+  try {
+    startupItems.value = await invoke<StartupItem[]>('list_startup_items')
+  } catch (value) { handleError(value) }
+  finally { toolsBusy.value = '' }
+}
+
+async function toggleStartupItem(item: StartupItem) {
+  toolsBusy.value = item.key
+  try {
+    await invoke(item.enabled ? 'disable_startup_item' : 'enable_startup_item', { key: item.key })
+    showNotice(item.enabled ? `已禁用「${item.name}」，备份已保存可随时恢复` : `已恢复「${item.name}」`, 3500, 'notice')
+    await loadStartupItems()
+  } catch (value) { handleError(value) }
+  finally { toolsBusy.value = '' }
+}
+
+const filteredPorts = computed(() => {
+  const kw = portFilter.value.trim().toLowerCase()
+  return ports.value.filter((p) => {
+    if (portFilterState.value === 'listening' && p.state !== 'LISTENING') return false
+    if (!kw) return true
+    return p.localPort.includes(kw) || p.process.toLowerCase().includes(kw) || String(p.pid).includes(kw) || p.localAddress.toLowerCase().includes(kw)
+  })
+})
+
+async function loadPorts() {
+  if (!isTauri) return
+  toolsBusy.value = 'ports'
+  try {
+    ports.value = await invoke<PortEntry[]>('list_ports')
+  } catch (value) { handleError(value) }
+  finally { toolsBusy.value = '' }
+}
+
+function armKill(pid: number) {
+  if (killArmPid.value === pid) {
+    killArmPid.value = 0
+    void doKill(pid)
+    return
+  }
+  killArmPid.value = pid
+  showNotice('再次点击「结束进程」确认终止', 3000, 'notice')
+  if (killArmTimer) clearTimeout(killArmTimer)
+  killArmTimer = window.setTimeout(() => { killArmPid.value = 0 }, 3000)
+}
+
+async function doKill(pid: number) {
+  toolsBusy.value = `kill:${pid}`
+  try {
+    await invoke('kill_process', { pid, force: true })
+    showNotice(`已结束进程 (PID ${pid})`, 3000, 'notice')
+    await loadPorts()
+  } catch (value) { handleError(value) }
+  finally { toolsBusy.value = '' }
+}
+
+async function loadDiskHealth() {
+  if (!isTauri) return
+  toolsBusy.value = 'health'
+  try {
+    health.value = await invoke<DiskHealthReport>('disk_health')
+  } catch (value) { handleError(value) }
+  finally { toolsBusy.value = '' }
+}
+
+async function runSpeedTest() {
+  if (!speedDrive.value || !isTauri) return
+  toolsBusy.value = 'speed'
+  speedResult.value = null
+  try {
+    speedResult.value = await invoke<SpeedTestResult>('run_speed_test', { drive: speedDrive.value })
+    showNotice(`${speedDrive.value}: 测速完成`, 3000, 'notice')
+  } catch (value) { handleError(value) }
+  finally { toolsBusy.value = '' }
+}
+
+function persistFavorites() {
+  localStorage.setItem('disk-analyzer-favorites', JSON.stringify(favorites.value))
+}
+
+function toggleFavorite(path: string) {
+  const i = favorites.value.indexOf(path)
+  if (i >= 0) { favorites.value.splice(i, 1) } else { favorites.value.push(path) }
+  persistFavorites()
+}
+
+function openFavorite(path: string) {
+  void analyzeFolder(path)
+}
+
 async function analyzeFolder(path: string, rememberCurrent = true) {
   page.value = 'files'
   if (rememberCurrent && folderAnalysis.value && folderAnalysis.value.path !== path) folderHistory.value.push(folderAnalysis.value.path)
@@ -2205,6 +2366,7 @@ onBeforeUnmount(() => {
         <button title="深度分析" :class="{ active: page === 'insights' }" @click="page = 'insights'"><ChartNoAxesCombined :size="17" /><span>深度分析</span></button>
         <button title="媒体管理" :class="{ active: page === 'media' }" @click="openMediaCenter"><Library :size="17" /><span>媒体管理</span><b v-if="mediaNew">新</b></button>
         <button title="注册表检查" :class="{ active: page === 'registry' }" @click="page = 'registry'"><Database :size="17" /><span>注册表检查</span></button>
+        <button title="系统工具" :class="{ active: page === 'tools' }" @click="page = 'tools'; if (toolsTab === 'startup' && !startupItems.length) loadStartupItems()"><Activity :size="17" /><span>系统工具</span></button>
       </nav>
 
       <div class="sidebar-label sidebar-drive-title"><span>本机磁盘</span><button title="重新检测磁盘" :disabled="loadingDrives" @click="loadDrives"><RefreshCw :size="12" :class="{ spin: loadingDrives }" /></button></div>
@@ -2217,6 +2379,15 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="sidebar-spacer" />
+      <template v-if="favorites.length">
+        <div class="sidebar-label sidebar-drive-title"><span>收藏目录</span><button title="清空收藏" @click="favorites = []; persistFavorites()"><Trash2 :size="12" /></button></div>
+        <div class="drive-list">
+          <button v-for="path in favorites" :key="path" class="drive-button" :title="path" @click="openFavorite(path)">
+            <Bookmark :size="15" /><span><b>{{ path.replace(/\\\\$/, '').split('\\\\').pop() || path }}</b><small class="fav-path" :title="path">{{ path }}</small></span>
+          </button>
+        </div>
+        <div class="sidebar-spacer" />
+      </template>
       <button class="settings-trigger" title="设置" @click="showSettings = true"><Settings :size="17" /><span><b>设置</b><small>{{ themeOptions.find(theme => theme.id === activeTheme)?.name }} · {{ fontScale === 'large' ? '大字号' : fontScale === 'small' ? '小字号' : '标准字号' }}</small></span><ChevronRight :size="15" /></button>
       <div class="safety-note"><ShieldCheck :size="17" /><div><b>默认只读</b><span>只有低风险白名单项目可在确认后清理</span></div></div>
       <div v-if="!isTauri" class="preview-badge"><Info :size="14" /> 界面预览</div>
@@ -2244,7 +2415,7 @@ onBeforeUnmount(() => {
           <button v-if="result && page === 'overview'" class="button secondary" @click="exportReport"><Download :size="17" /> 导出报告</button>
           <button v-if="page === 'files'" class="button secondary" :disabled="folderAnalyzing" @click="chooseFolder"><FolderSearch :size="17" /> 选择文件夹</button>
           <button v-if="scanning || folderAnalyzing || duplicateScanning" class="button danger" @click="cancelScan"><CircleStop :size="17" /> 取消分析</button>
-          <button v-else-if="page !== 'media' && page !== 'registry'" class="button primary" :disabled="!selectedDrive" @click="startScan()"><Play :size="17" fill="currentColor" /> {{ result ? '重新扫描' : '完整扫描' }}</button>
+          <button v-else-if="page !== 'media' && page !== 'registry' && page !== 'tools'" class="button primary" :disabled="!selectedDrive" @click="startScan()"><Play :size="17" fill="currentColor" /> {{ result ? '重新扫描' : '完整扫描' }}</button>
         </div>
       </header>
 
@@ -2347,7 +2518,126 @@ onBeforeUnmount(() => {
         <div class="current-path" :title="duplicateProgress.currentPath">{{ duplicateProgress.currentPath || '正在读取文件内容…' }}</div>
       </section>
 
-      <template v-if="page === 'registry'">
+      <template v-if="page === 'tools'">
+        <div class="tools-shell">
+          <section class="tools-hero">
+            <div class="tools-hero-icon"><Activity :size="26" /></div>
+            <div class="tools-hero-copy">
+              <span class="panel-kicker">SYSTEM</span>
+              <h2>系统工具</h2>
+              <p>管理开机启动项、排查端口占用、评估磁盘健康与真实读写性能。</p>
+            </div>
+            <div class="tools-hero-stats">
+              <div><b>{{ startupItems.length }}</b><span>启动项</span></div>
+              <div><b>{{ ports.length }}</b><span>端口</span></div>
+              <div><b>{{ health?.drives.length ?? 0 }}</b><span>磁盘</span></div>
+            </div>
+          </section>
+
+          <nav class="tools-nav" aria-label="系统工具">
+            <button :class="{ active: toolsTab === 'startup' }" @click="toolsTab = 'startup'; loadStartupItems()"><span class="tools-nav-icon"><Power :size="18" /></span><span class="tools-nav-copy"><b>启动项</b><small>随开机运行的程序</small></span><ChevronRight :size="15" /></button>
+            <button :class="{ active: toolsTab === 'ports' }" @click="toolsTab = 'ports'; loadPorts()"><span class="tools-nav-icon"><RadioTower :size="18" /></span><span class="tools-nav-copy"><b>端口占用</b><small>哪些进程占用了端口</small></span><ChevronRight :size="15" /></button>
+            <button :class="{ active: toolsTab === 'health' }" @click="toolsTab = 'health'; loadDiskHealth()"><span class="tools-nav-icon"><Gauge :size="18" /></span><span class="tools-nav-copy"><b>磁盘健康</b><small>SMART 状态与硬盘详情</small></span><ChevronRight :size="15" /></button>
+            <button :class="{ active: toolsTab === 'speed' }" @click="toolsTab = 'speed'"><span class="tools-nav-icon"><Zap :size="18" /></span><span class="tools-nav-copy"><b>读写测速</b><small>实测顺序 / 4K 性能</small></span><ChevronRight :size="15" /></button>
+          </nav>
+
+          <template v-if="toolsTab === 'startup'">
+            <section class="panel">
+              <div class="panel-heading"><div><span class="panel-kicker">开机启动</span><h2>启动项管理</h2></div>
+                <div class="panel-actions"><button class="button ghost" :disabled="toolsBusy === 'startup'" @click="loadStartupItems()"><RefreshCw :size="15" :class="{ spin: toolsBusy === 'startup' }" /> 刷新</button></div></div>
+              <div v-if="!startupItems.length" class="empty-state"><LoaderCircle v-if="toolsBusy === 'startup'" :size="26" class="spin" /><p v-else>未检测到启动项，点击右上「刷新」重新枚举。</p></div>
+              <div v-else class="tools-list">
+                <div v-for="item in startupItems" :key="item.key" class="tools-row" :class="{ off: !item.enabled }">
+                  <span class="tools-row-icon"><Power :size="16" /></span>
+                  <div class="tools-row-main"><b>{{ item.name }}</b><small v-if="item.filePath" :title="item.filePath">{{ item.filePath }}</small></div>
+                  <span class="tools-location"><span :class="item.location.includes('启动文件夹') ? 'folder' : 'run'">{{ item.location }}</span></span>
+                  <div class="tools-row-cmd" :title="item.command">{{ item.command || '—' }}</div>
+                  <span class="tools-state" :class="item.enabled ? 'on' : 'off'"><i /><em>{{ item.enabled ? '启用' : '已禁用' }}</em></span>
+                  <button class="button mini" :class="item.enabled ? 'danger-ghost' : 'primary'" :disabled="toolsBusy === item.key" @click="toggleStartupItem(item)">{{ item.enabled ? '禁用' : '恢复' }}</button>
+                </div>
+              </div>
+              <p class="panel-footnote">禁用会移除注册表值或重命名启动文件夹条目，原始内容备份在应用数据目录，可随时一键「恢复」。</p>
+            </section>
+          </template>
+
+          <template v-else-if="toolsTab === 'ports'">
+            <section class="panel">
+              <div class="panel-heading"><div><span class="panel-kicker">网络端口</span><h2>端口占用</h2></div>
+                <div class="panel-actions">
+                  <input v-model="portFilter" class="filter-input" placeholder="过滤端口 / 进程 / PID" />
+                  <div class="seg"><button :class="{ active: portFilterState === 'all' }" @click="portFilterState = 'all'">全部</button><button :class="{ active: portFilterState === 'listening' }" @click="portFilterState = 'listening'">监听中</button></div>
+                  <button class="button ghost" :disabled="toolsBusy === 'ports'" @click="loadPorts()"><RefreshCw :size="15" :class="{ spin: toolsBusy === 'ports' }" /> 刷新</button>
+                </div></div>
+              <div v-if="!filteredPorts.length" class="empty-state"><p>{{ ports.length ? '没有匹配的端口条目' : '暂无数据，点击「刷新」读取 netstat。' }}</p></div>
+              <div v-else class="tools-list ports-list">
+                <div v-for="p in filteredPorts" :key="`${p.pid}-${p.localAddress}-${p.localPort}-${p.remotePort}-${p.state}`" class="tools-row port-row">
+                  <span class="protocol-badge" :class="p.protocol.toLowerCase()">{{ p.protocol }}</span>
+                  <div class="port-addrs">
+                    <b class="mono">{{ p.localAddress }}:{{ p.localPort }}</b>
+                    <small v-if="p.remotePort && p.remotePort !== '*'" class="mono dim">→ {{ p.remoteAddress }}:{{ p.remotePort }}</small>
+                  </div>
+                  <span class="port-state" :class="p.state === 'LISTENING' ? 'listen' : 'other'"><i /><em>{{ p.state || '—' }}</em></span>
+                  <div class="tools-row-main"><b>{{ p.process }}</b><small class="mono dim">PID {{ p.pid }}</small></div>
+                  <button class="button mini danger-ghost" :disabled="toolsBusy === `kill:${p.pid}`" @click="armKill(p.pid)">{{ killArmPid === p.pid ? '确认结束?' : '结束进程' }}</button>
+                </div>
+              </div>
+              <p class="panel-footnote">共 {{ filteredPorts.length }} 条 · 「结束进程」以 taskkill /F 强制终止，请勿结束关键系统进程。</p>
+            </section>
+          </template>
+
+          <template v-else-if="toolsTab === 'health'">
+            <section class="panel">
+              <div class="panel-heading"><div><span class="panel-kicker">物理磁盘</span><h2>磁盘健康</h2></div>
+                <div class="panel-actions"><button class="button ghost" :disabled="toolsBusy === 'health'" @click="loadDiskHealth()"><RefreshCw :size="15" :class="{ spin: toolsBusy === 'health' }" /> 刷新</button></div></div>
+              <div v-if="!health" class="empty-state"><LoaderCircle v-if="toolsBusy === 'health'" :size="26" class="spin" /><p v-else>点击「刷新」读取磁盘健康状态。</p></div>
+              <template v-else>
+                <div v-if="health.smartOk === false" class="health-banner bad"><span class="health-banner-icon"><AlertTriangle :size="18" /></span><span><b>SMART 报告健康度不佳</b><small>请尽快备份重要数据，并考虑更换这块硬盘</small></span></div>
+                <div v-else-if="health.smartOk === true" class="health-banner good"><span class="health-banner-icon"><ShieldCheck :size="18" /></span><span><b>SMART 状态正常</b><small>所有物理磁盘健康度通过系统固件评估</small></span></div>
+                <div class="health-cards">
+                  <div v-for="d in health.drives" :key="d.index" class="health-card">
+                    <div class="health-card-top">
+                      <span class="health-card-icon" :class="d.mediaType?.toLowerCase().includes('ssd') ? 'ssd' : 'hdd'"><HardDrive :size="20" /></span>
+                      <div><b>{{ d.model || '未知型号' }}</b><small>{{ d.mediaType || '未知类型' }} · 物理磁盘 {{ d.index + 1 }}</small></div>
+                      <span class="health-status" :class="d.status === 'OK' || d.status === 'Healthy' ? 'ok' : 'warn'"><i /><em>{{ d.status }}</em></span>
+                    </div>
+                    <div class="health-meta">
+                      <span><small>序列号</small><b class="mono">{{ d.serial || '—' }}</b></span>
+                      <span><small>接口</small><b>{{ d.interface || '—' }}</b></span>
+                      <span><small>容量</small><b>{{ formatSize(d.sizeBytes) }}</b></span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <p class="panel-footnote">数据来自 WMI（Win32_DiskDrive / MSFT_PhysicalDisk），状态为系统固件报告值。</p>
+            </section>
+          </template>
+
+          <template v-else-if="toolsTab === 'speed'">
+            <section class="panel">
+              <div class="panel-heading"><div><span class="panel-kicker">实测性能</span><h2>磁盘读写测速</h2></div><small>顺序 192MB · 4K 随机 2000 次</small></div>
+              <div class="speed-zone">
+                <div class="speed-pick">
+                  <span class="speed-pick-label">选择测试盘</span>
+                  <select v-model="speedDrive">
+                    <option value="">请选择驱动器</option>
+                    <option v-for="d in drives" :key="d" :value="d.replace(':', '')">{{ d }} · 本地磁盘</option>
+                  </select>
+                  <button class="button primary" :disabled="!speedDrive || toolsBusy === 'speed'" @click="runSpeedTest()"><Zap :size="16" /> {{ toolsBusy === 'speed' ? '测速中…' : '开始测速' }}</button>
+                </div>
+                <div v-if="toolsBusy === 'speed'" class="speed-progress"><LoaderCircle :size="22" class="spin" /><p>正在向 {{ (speedDrive || '').toUpperCase() }}: 写入测试文件并随机读取…</p></div>
+                <div v-else-if="speedResult" class="speed-readout">
+                  <div class="speed-card"><small>顺序写入</small><b>{{ speedResult.seqWriteMbps.toFixed(1) }}<em>MB/s</em></b><span>{{ formatSize(speedResult.testBytes) }} 测试块</span></div>
+                  <div class="speed-card"><small>顺序读取</small><b>{{ speedResult.seqReadMbps.toFixed(1) }}<em>MB/s</em></b><span>读取同一测试块</span></div>
+                  <div class="speed-card"><small>4K 随机读</small><b>{{ speedResult.randRead4kIops.toFixed(0) }}<em>IOPS</em></b><span>{{ speedResult.randRead4kMbps.toFixed(1) }} MB/s</span></div>
+                </div>
+              </div>
+              <p class="panel-footnote">测试临时文件随测随删，测试期间所选磁盘占用会明显升高，请勿中断。</p>
+            </section>
+          </template>
+        </div>
+      </template>
+
+      <template v-else-if="page === 'registry'">
         <RegistryCleaner />
       </template>
 
@@ -2601,6 +2891,7 @@ onBeforeUnmount(() => {
             <button class="icon-button back-button" title="返回上一层结果" @click="leaveFolderAnalysis"><ArrowLeft :size="18" /></button>
             <span class="folder-detail-icon"><FolderTree :size="22" /></span>
             <div><span class="panel-kicker">文件夹下钻分析</span><h2>{{ folderAnalysis.name }}</h2><p :title="folderAnalysis.path">{{ folderAnalysis.path }}</p></div>
+            <button class="button secondary compact" :class="{ 'fav-on': favorites.includes(folderAnalysis.path) }" @click="toggleFavorite(folderAnalysis.path)"><Bookmark :size="15" :fill="favorites.includes(folderAnalysis.path) ? 'currentColor' : 'none'" />{{ favorites.includes(folderAnalysis.path) ? '已收藏' : '收藏' }}</button>
             <button class="button secondary compact" @click="openPath(folderAnalysis.path)"><FolderOpen :size="15" /> 打开目录</button>
           </section>
           <section class="folder-metrics">
@@ -2846,6 +3137,12 @@ onBeforeUnmount(() => {
         <template v-else-if="analysisTab === 'history'">
           <section v-if="snapshots.length" class="history-summary panel">
             <div class="panel-heading"><div><span class="panel-kicker">{{ selectedDrive }} 本地快照</span><h2>已用空间趋势</h2></div><div class="history-delta" :class="{ down: snapshotDelta < 0 }"><span>较上次</span><b>{{ snapshotDelta >= 0 ? '+' : '−' }}{{ formatSize(Math.abs(snapshotDelta)) }}</b></div></div>
+            <svg v-if="trendLine" class="trend-svg" viewBox="0 0 640 200" preserveAspectRatio="none">
+              <defs><linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#e8583e" stop-opacity=".28" /><stop offset="100%" stop-color="#e8583e" stop-opacity="0" /></linearGradient></defs>
+              <polygon :points="trendLine.area" fill="url(#trendFill)" />
+              <polyline :points="trendLine.line" fill="none" stroke="#e8583e" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke" />
+              <circle v-for="p in trendLine.pts" :key="p.x.id" :cx="p.px" :cy="p.py" r="3.5" fill="#e8583e" stroke="#fff" stroke-width="1.5"><title>{{ new Date(p.x.createdAt).toLocaleString('zh-CN') }} · 已用 {{ formatSize(p.x.used) }}</title></circle>
+            </svg>
             <div class="trend-chart"><div v-for="snapshot in snapshots" :key="snapshot.id" class="trend-column"><div class="trend-value">{{ Math.round(snapshot.used / snapshot.total * 100) }}%</div><div class="trend-track"><i :style="{ height: `${snapshot.used / snapshot.total * 100}%` }" /></div><span>{{ new Date(snapshot.createdAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) }}</span></div></div>
             <div class="history-list"><div v-for="snapshot in [...snapshots].reverse().slice(0, 6)" :key="snapshot.id"><span>{{ new Date(snapshot.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }}</span><b>{{ formatSize(snapshot.used) }}</b><small>{{ formatCount(snapshot.scannedFiles) }} 个文件</small><em>{{ snapshot.directories[0]?.name ?? '—' }} · {{ formatSize(snapshot.directories[0]?.size ?? 0) }}</em></div></div>
             <section v-if="snapshotDiff" class="snapshot-diff">
@@ -5008,5 +5305,394 @@ html[data-border-level="hard"] .duplicate-results.panel{
 .status-shade .shade-foot{
   margin-top:0!important;
   border-top:1px solid color-mix(in srgb, var(--u1-border, #edf0f2) 80%, transparent)!important;
+}
+
+/* ===== 系统工具页 ===== */
+.panel-actions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.panel-footnote{
+  margin:12px 0 0;
+  color:#8a94a3;
+  font-size:12px;
+  line-height:1.6;
+}
+.spin{animation:u1-spin 1s linear infinite}
+@keyframes u1-spin{to{transform:rotate(360deg)}}
+.filter-input{
+  padding:7px 12px;
+  border-radius:9px;
+  border:1px solid var(--u1-border, #dde3ea);
+  background:var(--u1-card-bg, #fff);
+  color:inherit;
+  font-size:12.5px;
+  width:190px;
+  outline:none;
+  transition:border-color .15s;
+}
+.filter-input:focus{border-color:var(--accent, #e8583e)}
+.seg{
+  display:inline-flex;
+  border:1px solid var(--u1-border, #dde3ea);
+  border-radius:9px;
+  overflow:hidden;
+  background:var(--u1-card-bg, #fff);
+}
+.seg button{
+  border:0;
+  background:transparent;
+  padding:7px 14px;
+  font-size:12.5px;
+  color:#667085;
+}
+.seg button.active{
+  background:color-mix(in srgb, var(--accent, #e8583e) 14%, #fff);
+  color:var(--accent, #e8583e);
+  font-weight:600;
+}
+.button.mini{
+  padding:5px 12px;
+  font-size:12px;
+  border-radius:8px;
+}
+.button.mini.danger-ghost{
+  background:transparent;
+  border:1px solid color-mix(in srgb, var(--accent, #e8583e) 45%, transparent);
+  color:var(--accent, #e8583e);
+}
+.button.mini.danger-ghost:hover:not(:disabled){background:color-mix(in srgb, var(--accent, #e8583e) 10%, #fff)}
+.button.mini:disabled{opacity:.5;cursor:not-allowed}
+
+/* 系统工具外壳与导航 */
+.tools-shell{display:grid;gap:14px}
+.tools-hero{
+  display:flex;
+  align-items:center;
+  gap:16px;
+  padding:18px 20px;
+  border-radius:var(--u1-radius, 14px);
+  background:linear-gradient(120deg, color-mix(in srgb, var(--accent, #e8583e) 12%, #fff), var(--u1-card-bg, #fff) 55%);
+  border:1px solid color-mix(in srgb, var(--accent, #e8583e) 22%, var(--u1-border, #e6eaf0));
+  box-shadow:var(--u1-shadow);
+}
+.tools-hero-icon{
+  width:52px;
+  height:52px;
+  flex:none;
+  display:grid;
+  place-items:center;
+  border-radius:14px;
+  background:var(--accent, #e8583e);
+  color:#fff;
+  box-shadow:0 6px 16px color-mix(in srgb, var(--accent, #e8583e) 35%, transparent);
+}
+.tools-hero-copy{flex:1;min-width:0}
+.tools-hero-copy h2{margin:2px 0 4px;font-size:17px;letter-spacing:-.02em}
+.tools-hero-copy p{margin:0;color:#667085;font-size:12.5px;line-height:1.6}
+.tools-hero-stats{display:flex;gap:10px}
+.tools-hero-stats>div{
+  min-width:76px;
+  padding:10px 12px;
+  border-radius:12px;
+  background:var(--u1-card-bg, #fff);
+  border:1px solid var(--u1-border, #e6eaf0);
+  text-align:center;
+}
+.tools-hero-stats b{display:block;font-size:18px;letter-spacing:-.02em}
+.tools-hero-stats span{font-size:11px;color:#8a94a3}
+.tools-nav{
+  display:grid;
+  grid-template-columns:repeat(4, 1fr);
+  gap:10px;
+}
+.tools-nav button{
+  display:flex;
+  align-items:center;
+  gap:11px;
+  padding:13px 14px;
+  border-radius:var(--u1-radius, 12px);
+  border:1px solid var(--u1-border, #e6eaf0);
+  background:var(--u1-card-bg, #fff);
+  color:inherit;
+  text-align:left;
+  transition:border-color .15s, box-shadow .15s;
+}
+.tools-nav button:hover{border-color:color-mix(in srgb, var(--accent, #e8583e) 40%, var(--u1-border, #e6eaf0))}
+.tools-nav button.active{
+  border-color:var(--accent, #e8583e);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--accent, #e8583e) 16%, transparent);
+}
+.tools-nav-icon{
+  width:36px;
+  height:36px;
+  flex:none;
+  display:grid;
+  place-items:center;
+  border-radius:10px;
+  background:color-mix(in srgb, var(--accent-soft, #fdeeea) 80%, #fff);
+  color:var(--accent, #e8583e);
+}
+.tools-nav button.active .tools-nav-icon{
+  background:var(--accent, #e8583e);
+  color:#fff;
+}
+.tools-nav-copy{flex:1;min-width:0}
+.tools-nav-copy b{display:block;font-size:13px}
+.tools-nav-copy small{display:block;margin-top:2px;font-size:11px;color:#8a94a3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tools-nav button>svg{flex:none;color:#b6c0cc}
+
+/* 工具列表行 */
+.tools-list{
+  display:grid;
+  gap:8px;
+  margin-top:6px;
+}
+.tools-row{
+  display:grid;
+  grid-template-columns:32px minmax(150px, 1.2fr) auto minmax(160px, 1.6fr) auto auto;
+  gap:12px;
+  align-items:center;
+  padding:11px 14px;
+  border:1px solid var(--u1-border, #e6eaf0);
+  border-radius:11px;
+  background:var(--u1-card-bg, #fff);
+  transition:opacity .2s;
+}
+.tools-row:hover{border-color:color-mix(in srgb, var(--accent, #e8583e) 30%, var(--u1-border, #e6eaf0))}
+.tools-row.off{opacity:.6}
+.tools-row-icon{
+  width:32px;
+  height:32px;
+  display:grid;
+  place-items:center;
+  border-radius:9px;
+  background:color-mix(in srgb, var(--accent-soft, #fdeeea) 70%, #fff);
+  color:var(--accent, #e8583e);
+}
+.tools-row-main{min-width:0}
+.tools-row-main b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tools-row-main small{
+  display:block;
+  margin-top:2px;
+  font-size:11px;
+  color:#8a94a3;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.tools-location span{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:20px;
+  font-size:11px;
+  white-space:nowrap;
+}
+.tools-location .run{background:#eef4ff;color:#3b62c7}
+.tools-location .folder{background:#eefaf4;color:#12805c}
+.tools-row-cmd{
+  font-family:Consolas,monospace;
+  font-size:11.5px;
+  color:#667085;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.tools-state{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  white-space:nowrap;
+}
+.tools-state i{width:8px;height:8px;border-radius:50%}
+.tools-state.on i{background:#22c55e}
+.tools-state.on em{color:#12805c;font-style:normal}
+.tools-state.off i{background:#94a3b8}
+.tools-state.off em{color:#8a94a3;font-style:normal}
+
+/* 端口 */
+.protocol-badge{
+  width:42px;
+  height:24px;
+  display:grid;
+  place-items:center;
+  border-radius:7px;
+  font-size:10.5px;
+  font-weight:700;
+  letter-spacing:.04em;
+}
+.protocol-badge.tcp{background:#eef4ff;color:#3b62c7}
+.protocol-badge.udp{background:#f3efff;color:#7a4fd0}
+.port-addrs{min-width:0}
+.port-addrs b{display:block;font-size:12.5px;font-family:Consolas,monospace}
+.port-addrs small{display:block;margin-top:2px;font-size:11px}
+.port-state{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:11.5px;
+  white-space:nowrap;
+}
+.port-state i{width:8px;height:8px;border-radius:50%}
+.port-state.listen i{background:#22c55e;box-shadow:0 0 0 3px #22c55e22}
+.port-state.listen em{font-style:normal;color:#12805c}
+.port-state.other i{background:#cbd5e1}
+.port-state.other em{font-style:normal;color:#8a94a3}
+.ports-list .tools-row{grid-template-columns:42px minmax(150px,1.2fr) auto minmax(150px,1.2fr) auto}
+
+/* 磁盘健康 */
+.health-banner{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:13px 16px;
+  border-radius:12px;
+  margin-bottom:14px;
+}
+.health-banner.good{background:#effaf5;border:1px solid #cdeedf}
+.health-banner.good b{color:#12805c}
+.health-banner.good .health-banner-icon{color:#12a47b}
+.health-banner.bad{background:#fff4ee;border:1px solid #ffdcc9}
+.health-banner.bad b{color:#c2571e}
+.health-banner.bad .health-banner-icon{color:#f59e0b}
+.health-banner-icon{width:34px;height:34px;flex:none;display:grid;place-items:center;border-radius:10px;background:#ffffffaa}
+.health-banner b{display:block;font-size:13px}
+.health-banner small{display:block;margin-top:2px;font-size:11.5px;color:#667085}
+.health-cards{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+  gap:12px;
+}
+.health-card{
+  border:1px solid var(--u1-border, #e6eaf0);
+  border-radius:13px;
+  padding:15px 16px;
+  background:var(--u1-card-bg, #fff);
+}
+.health-card-top{
+  display:flex;
+  align-items:center;
+  gap:11px;
+  margin-bottom:13px;
+}
+.health-card-icon{
+  width:40px;
+  height:40px;
+  flex:none;
+  display:grid;
+  place-items:center;
+  border-radius:11px;
+}
+.health-card-icon.ssd{background:#eef4ff;color:#3b62c7}
+.health-card-icon.hdd{background:#eefaf4;color:#12805c}
+.health-card-top>div{flex:1;min-width:0}
+.health-card-top b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.health-card-top small{display:block;margin-top:2px;font-size:11px;color:#8a94a3}
+.health-status{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:11.5px;
+  white-space:nowrap;
+}
+.health-status i{width:8px;height:8px;border-radius:50%}
+.health-status.ok i{background:#22c55e}
+.health-status.ok em{font-style:normal;color:#12805c}
+.health-status.warn i{background:#f59e0b}
+.health-status.warn em{font-style:normal;color:#c2571e}
+.health-meta{
+  display:grid;
+  grid-template-columns:1.6fr 1fr 1fr;
+  gap:8px 14px;
+  padding-top:11px;
+  border-top:1px dashed var(--u1-border, #e6eaf0);
+}
+.health-meta span{min-width:0}
+.health-meta small{display:block;color:#8a94a3;font-size:11px;margin-bottom:3px}
+.health-meta b{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 测速 */
+.speed-zone{margin-top:8px}
+.speed-pick{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  flex-wrap:wrap;
+  padding:16px 18px;
+  border-radius:13px;
+  border:1px dashed var(--u1-border, #dde3ea);
+  background:color-mix(in srgb, var(--u1-card-bg, #fff) 70%, transparent);
+}
+.speed-pick-label{font-size:12.5px;color:#667085}
+.speed-pick select{
+  padding:9px 12px;
+  border-radius:9px;
+  border:1px solid var(--u1-border, #dde3ea);
+  background:var(--u1-card-bg, #fff);
+  color:inherit;
+  font-size:13px;
+  min-width:210px;
+  outline:none;
+}
+.speed-pick select:focus{border-color:var(--accent, #e8583e)}
+.speed-progress{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:22px;
+  justify-content:center;
+  color:#667085;
+  font-size:13px;
+}
+.speed-progress p{margin:0}
+.speed-readout{
+  display:grid;
+  grid-template-columns:repeat(3, 1fr);
+  gap:12px;
+  margin-top:14px;
+}
+.speed-card{
+  border:1px solid var(--u1-border, #e6eaf0);
+  border-radius:13px;
+  padding:18px;
+  background:var(--u1-card-bg, #fff);
+  text-align:center;
+}
+.speed-card small{display:block;color:#8a94a3;font-size:11.5px;margin-bottom:8px}
+.speed-card b{
+  font-size:28px;
+  letter-spacing:-.03em;
+  color:var(--accent, #e8583e);
+  font-variant-numeric:tabular-nums;
+}
+.speed-card b em{
+  font-style:normal;
+  font-size:12px;
+  color:#8a94a3;
+  margin-left:4px;
+  letter-spacing:0;
+}
+.speed-card>span{display:block;font-size:11px;color:#8a94a3;margin-top:7px}
+.fav-path{
+  max-width:170px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.button.compact.fav-on{
+  border-color:color-mix(in srgb, var(--accent, #e8583e) 55%, transparent);
+  color:var(--accent, #e8583e);
+}
+.trend-svg{
+  display:block;
+  width:100%;
+  height:150px;
+  margin:4px 0 6px;
+  border:1px solid var(--u1-border, #e6eaf0);
+  border-radius:var(--u1-radius, 12px);
+  background:var(--u1-card-bg, #fff);
 }
 </style>
