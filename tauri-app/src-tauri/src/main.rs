@@ -3,10 +3,13 @@
 mod app_cache_rules;
 mod dev_rules;
 mod disk_health;
+mod icons;
 mod media;
 mod port_tools;
+mod process_tools;
 mod recycle;
 mod registry;
+mod services;
 mod startup_tools;
 mod tool_ai_rules;
 mod win_cmd;
@@ -1323,6 +1326,41 @@ async fn run_speed_test(drive: String) -> Result<disk_health::SpeedTestResult, S
     tauri::async_runtime::spawn_blocking(move || disk_health::run_speed_test(&drive))
         .await
         .map_err(|e| format!("测速失败: {e}"))?
+}
+
+#[tauri::command]
+async fn list_services() -> Result<services::ServiceOverview, String> {
+    tauri::async_runtime::spawn_blocking(services::list_services)
+        .await
+        .map_err(|e| format!("读取服务列表失败: {e}"))?
+}
+
+#[tauri::command]
+async fn set_service(name: String, action: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || services::set_service(&name, &action))
+        .await
+        .map_err(|e| format!("操作服务失败: {e}"))?
+}
+
+#[tauri::command]
+async fn list_processes() -> Result<Vec<process_tools::ProcessEntry>, String> {
+    tauri::async_runtime::spawn_blocking(process_tools::list_processes)
+        .await
+        .map_err(|e| format!("读取进程列表失败: {e}"))?
+}
+
+#[tauri::command]
+async fn extract_icons(paths: Vec<String>) -> Result<HashMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || icons::extract_icons(paths))
+        .await
+        .map_err(|e| format!("提取图标失败: {e}"))?
+}
+
+#[tauri::command]
+async fn sample_system_load() -> Result<services::SystemLoad, String> {
+    tauri::async_runtime::spawn_blocking(services::sample_system_load)
+        .await
+        .map_err(|e| format!("采样系统负载失败: {e}"))?
 }
 
 #[tauri::command]
@@ -2893,6 +2931,11 @@ start_scan,
             kill_process,
             disk_health,
             run_speed_test,
+            list_services,
+            set_service,
+            list_processes,
+            extract_icons,
+            sample_system_load,
             list_cleanup_snapshots,
             delete_cleanup_snapshot,
             analyze_registry,

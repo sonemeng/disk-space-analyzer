@@ -15,6 +15,8 @@ pub struct PortEntry {
     pub state: String,
     pub pid: u64,
     pub process: String,
+    /// 进程可执行文件路径（用于前端提取真实图标），未知为 None
+    pub path: Option<String>,
 }
 
 fn split_host_port(s: &str) -> (String, String) {
@@ -67,12 +69,23 @@ pub fn list_ports() -> Result<Vec<PortEntry>, String> {
             state,
             pid,
             process: String::new(),
+            path: None,
         });
     }
     let names = process_name_map();
+    let mut seen_pids = Vec::new();
     for entry in &mut entries {
         if let Some(name) = names.get(&entry.pid) {
             entry.process = name.clone();
+        }
+        if entry.pid > 0 && entry.path.is_none() && !seen_pids.contains(&entry.pid) {
+            seen_pids.push(entry.pid);
+        }
+    }
+    let pid_paths = pid_path_map(&seen_pids);
+    for entry in &mut entries {
+        if let Some(path) = pid_paths.get(&entry.pid) {
+            entry.path = Some(path.clone());
         }
     }
     // 常用排序：监听优先，其次已建立，最后其他
@@ -111,6 +124,47 @@ fn process_name_map() -> HashMap<u64, String> {
                     map.entry(pid).or_insert(name);
                 }
             }
+        }
+    }
+    map
+}
+
+fn pid_path_map(pids: &[u64]) -> HashMap<u64, String> {
+    let mut map = HashMap::new();
+    if pids.is_empty() {
+        return map;
+    }
+    // Get-Process -Id 一次取全部目标进程的可执行路径（-ErrorAction 静默缺进程）
+    let list = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let ps = format!(
+        "Get-Process -Id {list} -ErrorAction SilentlyContinue | ForEach-Object {{ \"$($_.Id)|$($_.Path)\" }}"
+    );
+    let out = match hidden(Command::new("powershell"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return map,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((pid, path)) = line.split_once('|') else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if let Ok(pid) = pid.trim().parse::<u64>() {
+            map.entry(pid).or_insert(path.to_string());
         }
     }
     map

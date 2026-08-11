@@ -30,6 +30,8 @@ pub struct StartupItem {
     pub location: String,
     pub enabled: bool,
     pub file_path: Option<String>,
+    /// data-url 图标（png base64），提取失败为 None
+    pub icon: Option<String>,
     /// 唯一标识：reg:<HKLM|HKCU>:<键>:<值名> 或 folder:<绝对路径>
     pub key: String,
 }
@@ -62,6 +64,22 @@ fn write_backups(backups: &[StartupBackup]) -> Result<(), String> {
     fs::write(path, content).map_err(|e| format!("保存备份失败: {e}"))
 }
 
+/// REG_SZ/REG_EXPAND_SZ 为 UTF-16LE 宽字符，正确解码并去末尾 \0。
+fn decode_reg_string(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let u16s: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let mut s = String::from_utf16(&u16s).ok()?;
+    while s.ends_with('\0') {
+        s.pop();
+    }
+    Some(s)
+}
+
 fn collect_registry_entries(hive: HKEY, key_path: &str, label: &str, out: &mut Vec<StartupItem>) {
     let Ok(reg) = RegKey::predef(hive).open_subkey(key_path) else {
         return;
@@ -70,9 +88,15 @@ fn collect_registry_entries(hive: HKEY, key_path: &str, label: &str, out: &mut V
         if !matches!(value.vtype, RegType::REG_SZ | RegType::REG_EXPAND_SZ) {
             continue;
         }
-        let text = String::from_utf8_lossy(&value.bytes)
-            .trim_end_matches('\0')
-            .to_string();
+        let text = decode_reg_string(&value.bytes)
+            .or_else(|| {
+                Some(
+                    String::from_utf8_lossy(&value.bytes)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
+            })
+            .unwrap_or_default();
         if text.trim().is_empty() || name.starts_with("__da_disabled_") {
             continue;
         }
@@ -83,6 +107,7 @@ fn collect_registry_entries(hive: HKEY, key_path: &str, label: &str, out: &mut V
             location: label.to_string(),
             enabled: true,
             file_path: None,
+            icon: None,
             key: format!("reg:{hive_label}:{key_path}:{name}"),
         });
     }
@@ -123,6 +148,7 @@ fn collect_folder_entries(out: &mut Vec<StartupItem>) {
                 location: label.to_string(),
                 enabled: true,
                 file_path: Some(path.to_string_lossy().into_owned()),
+                icon: None,
                 key: format!("folder:{}", path.to_string_lossy()),
             });
         }
@@ -183,7 +209,69 @@ pub fn list_startup_items() -> Result<Vec<StartupItem>, String> {
             .cmp(&b.location)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    enrich_icons(&mut items);
     Ok(items)
+}
+
+/// 从注册表命令中解析出可提取图标的文件路径（与 folder 条目共用）。
+fn resolve_command_path(cmd: &str) -> Option<String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let head = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else {
+        cmd.split_whitespace().next().unwrap_or("")
+    };
+    if head.is_empty() {
+        return None;
+    }
+    if head.eq_ignore_ascii_case("start") {
+        return match cmd.find('"') {
+            Some(i) => {
+                let rest = &cmd[i + 1..];
+                match rest.find('"') {
+                    Some(j) => Some(rest[..j].to_string()),
+                    None => None,
+                }
+            }
+            None => None,
+        };
+    }
+    let head = head.to_string();
+    // 兼容坏写入的 \\ 路径（如 "D:\\Weixin\Weixin.exe"），UNC 开头不动
+    if !head.starts_with('\\') {
+        return Some(head.replace("\\\\", "\\"));
+    }
+    Some(head)
+}
+
+/// 批量提取程序关联图标（复用 icons 模块），失败项保持 None。
+fn enrich_icons(items: &mut [StartupItem]) {
+    let mut targets: Vec<(usize, String)> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let path = match &item.file_path {
+            Some(f) if !f.trim().is_empty() => f.clone(),
+            _ => match resolve_command_path(&item.command) {
+                Some(p) => p,
+                None => continue,
+            },
+        };
+        targets.push((i, path));
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let paths = targets.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>();
+    let Ok(map) = crate::icons::extract_icons(paths) else {
+        return;
+    };
+    for (i, path) in targets {
+        if let Some(icon) = map.get(&path) {
+            items[i].icon = Some(icon.clone());
+        }
+    }
 }
 
 pub fn disable_startup_item(key: &str) -> Result<(), String> {
@@ -198,9 +286,15 @@ pub fn disable_startup_item(key: &str) -> Result<(), String> {
         let value = reg
             .get_raw_value(&name)
             .map_err(|e| format!("读取注册表值失败: {e}"))?;
-        let text = String::from_utf8_lossy(&value.bytes)
-            .trim_end_matches('\0')
-            .to_string();
+        let text = decode_reg_string(&value.bytes)
+            .or_else(|| {
+                Some(
+                    String::from_utf8_lossy(&value.bytes)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
+            })
+            .unwrap_or_default();
         reg.delete_value(&name)
             .map_err(|e| format!("删除注册表值失败: {e}"))?;
         backups.push(StartupBackup {
